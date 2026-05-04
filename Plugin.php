@@ -22,9 +22,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             // 创建访问记录表
             self::createTable();
             
-            // 数据库升级
-            self::upgradeDatabase();
-            
             // 绑定限流检查到index.php的begin钩子（在路由分发前执行）
             Typecho_Plugin::factory('index.php')->begin = array(
                 'RecentViewsCounter_Plugin',
@@ -81,59 +78,57 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         try {
             $db = Typecho_Db::get();
             $prefix = $db->getPrefix();
-            
+            $driver = $db->getAdapterName();
+            $isSqlite = stripos($driver, 'sqlite') !== false;
+
             // 创建访问记录表
             $sql = "CREATE TABLE IF NOT EXISTS `{$prefix}views_records` (
-                `id` int(11) NOT NULL AUTO_INCREMENT,
-                `cid` int(11) NOT NULL COMMENT '文章ID',
-                `visit_time` int(11) NOT NULL COMMENT '访问时间戳',
-                `ip` varchar(45) NOT NULL COMMENT '访问者IP地址',
-                `location` varchar(255) DEFAULT NULL COMMENT 'IP归属地',
-                `user_agent` text DEFAULT NULL COMMENT '用户代理',
-                `referer` varchar(500) DEFAULT NULL COMMENT '访问来源URL',
-                PRIMARY KEY (`id`),
-                KEY `idx_cid` (`cid`),
-                KEY `idx_visit_time` (`visit_time`),
-                KEY `idx_ip` (`ip`),
-                KEY `idx_referer` (`referer`(255))
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文章访问记录表'";
+                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `cid` INTEGER NOT NULL,
+                `visit_time` INTEGER NOT NULL,
+                `ip` TEXT NOT NULL,
+                `location` TEXT,
+                `user_agent` TEXT,
+                `referer` TEXT
+            )";
+            if (!$isSqlite) {
+                $sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+            }
             
             error_log('RecentViewsCounter: 执行创建views_records表SQL');
             $db->query($sql);
             
             // 创建月度统计表
             $monthly_sql = "CREATE TABLE IF NOT EXISTS `{$prefix}monthly_stats` (
-                `id` int(11) NOT NULL AUTO_INCREMENT,
-                `year_month` varchar(7) NOT NULL COMMENT '年月(YYYY-MM)',
-                `total_visits` int(11) NOT NULL DEFAULT 0 COMMENT '当月总访问量',
-                `unique_visitors` int(11) NOT NULL DEFAULT 0 COMMENT '当月独立访客数',
-                `created_time` int(11) NOT NULL COMMENT '创建时间戳',
-                `updated_time` int(11) NOT NULL COMMENT '更新时间戳',
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `year_month` (`year_month`),
-                KEY `idx_year_month` (`year_month`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='月度访问统计表';";
+                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `year_month` TEXT NOT NULL,
+                `total_visits` INTEGER NOT NULL DEFAULT 0,
+                `unique_visitors` INTEGER NOT NULL DEFAULT 0,
+                `created_time` INTEGER NOT NULL,
+                `updated_time` INTEGER NOT NULL
+            )";
+            if (!$isSqlite) {
+                $monthly_sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+            }
             
             error_log('RecentViewsCounter: 执行创建monthly_stats表SQL');
             $db->query($monthly_sql);
             
             // 创建IP归属地本地数据库表
             $ip_location_sql = "CREATE TABLE IF NOT EXISTS `{$prefix}ip_location` (
-                `id` int(11) NOT NULL AUTO_INCREMENT,
-                `ip` varchar(45) NOT NULL COMMENT 'IP地址',
-                `location` varchar(255) NOT NULL COMMENT 'IP归属地',
-                `country` varchar(100) DEFAULT NULL COMMENT '国家',
-                `region` varchar(100) DEFAULT NULL COMMENT '省份/地区',
-                `city` varchar(100) DEFAULT NULL COMMENT '城市',
-                `isp` varchar(100) DEFAULT NULL COMMENT '运营商',
-                `created_time` int(11) NOT NULL COMMENT '创建时间戳',
-                `updated_time` int(11) NOT NULL COMMENT '更新时间戳',
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `ip` (`ip`),
-                KEY `idx_location` (`location`),
-                KEY `idx_country` (`country`),
-                KEY `idx_created_time` (`created_time`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='IP归属地本地数据库表';";
+                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `ip` TEXT NOT NULL,
+                `location` TEXT NOT NULL,
+                `country` TEXT,
+                `region` TEXT,
+                `city` TEXT,
+                `isp` TEXT,
+                `created_time` INTEGER NOT NULL,
+                `updated_time` INTEGER NOT NULL
+            )";
+            if (!$isSqlite) {
+                $ip_location_sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+            }
             
             error_log('RecentViewsCounter: 执行创建ip_location表SQL');
             $db->query($ip_location_sql);

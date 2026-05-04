@@ -11,6 +11,30 @@ $options = Typecho_Widget::widget('Widget_Options');
 $plugin_config = $options->plugin('RecentViewsCounter');
 $top_count = $plugin_config ? intval($plugin_config->top_count) : 10;
 
+// 获取蜘蛛检测模式数组（复用函数）
+function getBotPatterns() {
+    return array(
+        'Googlebot', 'Bingbot', 'Slurp', 'DuckDuckBot', 'Baiduspider',
+        'YandexBot', 'YandexAccessibilityBot', 'YandexMobileBot', 'YandexDirectDyn',
+        'facebookexternalhit', 'Twitterbot', 'rogerbot', 'linkedinbot',
+        'embedly', 'quora link preview', 'showyoubot', 'outbrain', 'pinterest',
+        'developers.google.com/+/web/snippet', 'slackbot', 'vkShare',
+        'W3C_Validator', 'redditbot', 'Applebot', 'WhatsApp', 'flipboard',
+        'tumblr', 'bitlybot', 'SkypeUriPreview', 'nuzzel', 'Discordbot',
+        'Google Page Speed', 'Qwantify', 'pinterestbot', 'Bitrix link preview',
+        'XING-contenttabreceiver', 'Chrome-Lighthouse', 'TelegramBot',
+        'SemrushBot', 'AhrefsBot', 'MJ12bot', 'DotBot', 'Mediapartners-Google',
+        'AdsBot-Google', 'Googlebot-News', 'Googlebot-Image', 'Googlebot-Video',
+        'Googlebot-Mobile', 'msnbot', 'bingbot', 'ia_archiver', 'Wayback',
+        'archive.org_bot', 'CCBot', 'SeznamBot', 'MojeekBot', 'DuckDuckGo-Favicons-Bot',
+        // 中国搜索引擎爬虫
+        'Baiduspider-render', 'Baiduspider-image', 'Baiduspider-news', 'Baiduspider-video',
+        'Sogou web spider', 'Sogou News Spider', 'Sogou Pic Spider', 'Sogou Video Spider',
+        'HaoSouSpider', '360Spider', 'JikeSpider', 'YisouSpider', 'ToutiaoSpider',
+        'ByteSpider', 'PetalBot', 'spider', 'crawler', 'bot'
+    );
+}
+
 // 智能Bot检测说明内容（复用）
 $bot_detection_info = "智能Bot检测说明：
 基于多维度分析(User-Agent识别、访问频率、行为模式等)。
@@ -394,26 +418,7 @@ if ($plugin_config && $plugin_config->enable_referer == '1') {
 }
 
 // 获取总蜘蛛数（通过User-Agent识别）
-$bot_patterns = array(
-    'Googlebot', 'Bingbot', 'Slurp', 'DuckDuckBot', 'Baiduspider', 
-    'YandexBot', 'YandexAccessibilityBot', 'YandexMobileBot', 'YandexDirectDyn',
-    'facebookexternalhit', 'Twitterbot', 'rogerbot', 'linkedinbot', 
-    'embedly', 'quora link preview', 'showyoubot', 'outbrain', 'pinterest', 
-    'developers.google.com/+/web/snippet', 'slackbot', 'vkShare', 
-    'W3C_Validator', 'redditbot', 'Applebot', 'WhatsApp', 'flipboard', 
-    'tumblr', 'bitlybot', 'SkypeUriPreview', 'nuzzel', 'Discordbot', 
-    'Google Page Speed', 'Qwantify', 'pinterestbot', 'Bitrix link preview', 
-    'XING-contenttabreceiver', 'Chrome-Lighthouse', 'TelegramBot', 
-    'SemrushBot', 'AhrefsBot', 'MJ12bot', 'DotBot', 'Mediapartners-Google',
-    'AdsBot-Google', 'Googlebot-News', 'Googlebot-Image', 'Googlebot-Video',
-    'Googlebot-Mobile', 'msnbot', 'bingbot', 'ia_archiver', 'Wayback',
-    'archive.org_bot', 'CCBot', 'SeznamBot', 'MojeekBot', 'DuckDuckGo-Favicons-Bot',
-    // 中国搜索引擎爬虫
-    'Baiduspider-render', 'Baiduspider-image', 'Baiduspider-news', 'Baiduspider-video',
-    'Sogou web spider', 'Sogou News Spider', 'Sogou Pic Spider', 'Sogou Video Spider',
-    'HaoSouSpider', '360Spider', 'JikeSpider', 'YisouSpider', 'ToutiaoSpider',
-    'ByteSpider', 'PetalBot', 'spider', 'crawler', 'bot'
-);
+$bot_patterns = getBotPatterns();
 
 // 使用原生SQL统计bot访问量，确保时间条件和bot条件都正确应用
 try {
@@ -533,9 +538,11 @@ foreach ($top_ips as &$ip_data) {
     
     // User-Agent检测 (权重: 40)
     $sample_ua = $ip_data['sample_user_agent'] ?: '';
+    $detected_bot_name = '';
     foreach ($bot_patterns as $pattern) {
         if (stripos($sample_ua, $pattern) !== false) {
             $bot_score += 40;
+            $detected_bot_name = $pattern;
             break;
         }
     }
@@ -558,6 +565,7 @@ foreach ($top_ips as &$ip_data) {
     $ip_data['bot_score'] = $bot_score;
     $ip_data['is_bot'] = ($bot_score >= 30) ? 1 : 0; // 30分以上认为是bot
     $ip_data['is_bot_ua'] = $bot_score >= 40 ? 1 : 0;
+    $ip_data['detected_bot_name'] = $detected_bot_name; // 存储检测到的bot名称
     $ip_data['is_high_frequency'] = $ip_data['count'] > 100 ? 1 : 0;
     $ip_data['is_focused_crawler'] = ($focus_ratio < 0.1 && $ip_data['count'] > 20) ? 1 : 0;
 }
@@ -568,27 +576,51 @@ $week_data = array();
 // 获取最近30天的访问趋势数据
 try {
     $thirty_days_ago = time() - 30 * 24 * 3600;
-    $query = $db->select('visit_time')->from('table.views_records')
+    $query = $db->select('visit_time, user_agent')->from('table.views_records')
                 ->where('visit_time > ?', $thirty_days_ago);
     
     $records = $db->fetchAll($query->order('visit_time', Typecho_Db::SORT_ASC));
     
-    // 在PHP中按天分组
+    // Bot检测模式数组（复用）
+     $bot_patterns = getBotPatterns();
+    
+    // 在PHP中按天分组，同时统计蜘蛛访问
     $grouped_stats = array();
+    $grouped_bots = array();
     foreach ($records as $record) {
         $date = date('Y-m-d', $record['visit_time']);
         if (!isset($grouped_stats[$date])) {
             $grouped_stats[$date] = 0;
+            $grouped_bots[$date] = 0;
         }
         $grouped_stats[$date]++;
+        
+        // 检测是否为蜘蛛
+        $is_bot = false;
+        $user_agent = strtolower($record['user_agent']);
+        foreach ($bot_patterns as $pattern) {
+            if (strpos($user_agent, strtolower($pattern)) !== false) {
+                $is_bot = true;
+                break;
+            }
+        }
+        if ($is_bot) {
+            $grouped_bots[$date]++;
+        }
     }
     
     // 转换为图表数据格式
     foreach ($grouped_stats as $date => $count) {
+        $bot_count = intval($grouped_bots[$date]);
+        $daily_visits = intval($count); // 修改变量名避免与总访问量变量冲突
+        $real_users = $daily_visits - $bot_count; // 非蜘蛛数（真实用户访问量）
+        
         $week_data[] = array(
             'date' => date('m-d', strtotime($date)),
             'full_date' => $date,
-            'visits' => intval($count)
+            'visits' => $daily_visits,
+            'real_users' => $real_users,
+            'bots' => $bot_count
         );
     }
 } catch (Exception $e) {
@@ -605,11 +637,11 @@ try {
                 <!-- 统一时间范围选择器 -->
                 <div class="typecho-page-main" style="margin-bottom: 20px;">
                     <div style="background: #fff; padding: 15px; border: 1px solid #e9e9e6; border-radius: 4px;">
-                        <div style="display: flex; align-items: center; gap: 20px;">
+                        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 20px;">
                             <h4 style="margin: 0; color: #495057;">📊 数据时间范围</h4>
-                            <div style="display: flex; align-items: center; gap: 10px;">
+                            <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px;">
                                 <label style="font-size: 14px; color: #666;">选择时间范围：</label>
-                                <select id="global_time_range" onchange="changeGlobalTimeRange()" style="padding: 6px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; background: #fff;">
+                                <select id="global_time_range" onchange="changeGlobalTimeRange()" style="width: 140px; min-width: 140px; height: 36px; flex: 0 0 140px; padding: 4px 32px 4px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; line-height: 20px; background: #fff; box-sizing: border-box; vertical-align: middle;">
                                     <option value="7">近7天</option>
                                     <option value="30">近30天</option>
                                     <option value="all">全部时间</option>
@@ -625,16 +657,16 @@ try {
                 </div>
                 
                 <!-- 统计概览 -->
-                <div class="row typecho-page-main" style="margin-bottom: 20px;">
-                    <div class="col-mb-3" style="text-align: center; padding: 20px; background: #f9f9f9; margin-right: 10px;">
+                <div class="row typecho-page-main" style="margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 10px; max-width: 800px;">
+                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
                         <h3 style="margin: 0; color: #467b96;"><?php echo $total_visits ? $total_visits['count'] : 0; ?></h3>
                         <p style="margin: 5px 0 0 0;">总访问量</p>
                     </div>
-                    <div class="col-mb-3" style="text-align: center; padding: 20px; background: #f9f9f9;margin-right: 10px;">
+                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
                         <h3 style="margin: 0; color: #dc3545;"><?php echo $total_bots ? $total_bots['count'] : 0; ?></h3>
                         <p style="margin: 5px 0 0 0;">总蜘蛛数</p>
                     </div>
-                    <div class="col-mb-3" style="text-align: center; padding: 20px; background: #f9f9f9; margin-right: 10px;">
+                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
                         <h3 style="margin: 0; color: #467b96;"><?php echo $unique_visitors ? $unique_visitors['count'] : 0; ?></h3>
                         <p style="margin: 5px 0 0 0;">独立访客</p>
                     </div>
@@ -643,16 +675,16 @@ try {
                 <!-- 访问趋势 -->
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>每日访问趋势 <span style="font-size: 14px; color: #666; font-weight: normal;">(最近30天，不受上方时间选择器影响)</span></h3>
-                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6;">
-                        <canvas id="visitChart" width="800" height="200"></canvas>
+                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6; max-width: 100%; box-sizing: border-box; overflow-x: auto;">
+                        <canvas id="visitChart" style="width: 100%; max-width: 1200px; height: 300px; display: block; margin: 0 auto;"></canvas>
                     </div>
                 </div>
 
                 <!-- 月度访问统计 -->
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>月度访问统计 <span style="font-size: 14px; color: #666; font-weight: normal;">(最近24个月，不受上方时间选择器影响)</span></h3>
-                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6;">
-                        <canvas id="monthlyChart" width="800" height="200"></canvas>
+                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6; max-width: 100%; box-sizing: border-box; overflow-x: auto;">
+                        <canvas id="monthlyChart" style="width: 100%; max-width: 1200px; height: 300px; display: block; margin: 0 auto;"></canvas>
                     </div>
                 </div>
 
@@ -660,8 +692,8 @@ try {
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>访问者地域分布 TOP 10</h3>
                     <?php if (!empty($location_stats)): ?>
-                    <div class="typecho-table-wrap">
-                        <table class="typecho-list-table">
+                    <div class="typecho-table-wrap" style="overflow-x: auto;">
+                        <table class="typecho-list-table" style="min-width: 600px;">
                             <colgroup>
                                 <col width="10%"/>
                                 <col width="60%"/>
@@ -724,32 +756,32 @@ try {
                     <h3>访问来源统计</h3>
                     
                     <!-- 来源类型概览 -->
-                    <div style="display: flex; gap: 10px; margin-bottom: 20px;">
-                        <div style="flex: 1; text-align: center; padding: 15px; background: #f3e5f5; border-radius: 4px;">
+                    <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; max-width: 900px;">
+                        <div style="flex: 1; min-width: 120px; text-align: center; padding: 15px; background: #f3e5f5; border-radius: 4px;">
                             <h4 style="margin: 0; color: #9c27b0;"><?php echo $referer_stats['direct']['count']; ?></h4>
                             <p style="margin: 5px 0 0 0; font-size: 12px;">直接访问</p>
                         </div>
-                        <div style="flex: 1; text-align: center; padding: 15px; background: #e8f5e8; border-radius: 4px;">
+                        <div style="flex: 1; min-width: 120px; text-align: center; padding: 15px; background: #e8f5e8; border-radius: 4px;">
                             <h4 style="margin: 0; color: #28a745;"><?php echo $referer_stats['search']['count']; ?></h4>
                             <p style="margin: 5px 0 0 0; font-size: 12px;">搜索引擎</p>
                         </div>
-                        <div style="flex: 1; text-align: center; padding: 15px; background: #e3f2fd; border-radius: 4px;">
+                        <div style="flex: 1; min-width: 120px; text-align: center; padding: 15px; background: #e3f2fd; border-radius: 4px;">
                             <h4 style="margin: 0; color: #2196f3;"><?php echo $referer_stats['social']['count']; ?></h4>
                             <p style="margin: 5px 0 0 0; font-size: 12px;">社交媒体</p>
                         </div>
-                        <div style="flex: 1; text-align: center; padding: 15px; background: #fff3e0; border-radius: 4px;">
+                        <div style="flex: 1; min-width: 120px; text-align: center; padding: 15px; background: #fff3e0; border-radius: 4px;">
                             <h4 style="margin: 0; color: #ff9800;"><?php echo $referer_stats['external']['count']; ?></h4>
                             <p style="margin: 5px 0 0 0; font-size: 12px;">外部链接</p>
                         </div>
-                        <div style="flex: 1; text-align: center; padding: 15px; background: #f0f4ff; border-radius: 4px;">
+                        <div style="flex: 1; min-width: 120px; text-align: center; padding: 15px; background: #f0f4ff; border-radius: 4px;">
                             <h4 style="margin: 0; color: #6366f1;"><?php echo $referer_stats['internal']['count']; ?></h4>
                             <p style="margin: 5px 0 0 0; font-size: 12px;">站内跳转</p>
                         </div>
                     </div>
                     
                     <!-- 详细来源列表 -->
-                    <div class="typecho-table-wrap">
-                        <table class="typecho-list-table">
+                    <div class="typecho-table-wrap" style="overflow-x: auto;">
+                        <table class="typecho-list-table" style="min-width: 700px;">
                             <colgroup>
                                 <col width="15%"/>
                                 <col width="35%"/>
@@ -857,8 +889,8 @@ try {
                          </small>
                     </h3>
                     <?php if (!empty($top_ips)): ?>
-                    <div class="typecho-table-wrap">
-                        <table class="typecho-list-table">
+                    <div class="typecho-table-wrap" style="overflow-x: auto;">
+                        <table class="typecho-list-table" style="min-width: 900px;">
                             <colgroup>
                                 <col width="5%"/>
                                 <col width="18%"/>
@@ -933,7 +965,11 @@ try {
                                     <td>
                                         <?php 
                                         $detection_details = array();
-                                        if ($ip_data['is_bot_ua']) $detection_details[] = 'UA识别';
+                                        if ($ip_data['is_bot_ua'] && !empty($ip_data['detected_bot_name'])) {
+                                            $detection_details[] = $ip_data['detected_bot_name'];
+                                        } elseif ($ip_data['is_bot_ua']) {
+                                            $detection_details[] = 'UA识别';
+                                        }
                                         if ($ip_data['is_high_frequency']) $detection_details[] = '高频访问';
                                         if ($ip_data['is_focused_crawler']) $detection_details[] = '专注爬取';
                                         if ($ip_data['empty_ua_ratio'] > 0.5) $detection_details[] = '空UA';
@@ -996,8 +1032,8 @@ try {
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>近期热门文章 TOP <?php echo $top_count; ?></h3>
                     <?php if (!empty($top_articles)): ?>
-                    <div class="typecho-table-wrap">
-                        <table class="typecho-list-table">
+                    <div class="typecho-table-wrap" style="overflow-x: auto;">
+                        <table class="typecho-list-table" style="min-width: 700px;">
                             <colgroup>
                                 <col width="5%"/>
                                 <col width="50%"/>
@@ -1076,7 +1112,7 @@ try {
                 <!-- 数据库统计信息 -->
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>数据库统计</h3>
-                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6;">
+                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-wrap: anywhere;">
                         <?php if (isset($clean_message)): ?>
                         <div style="background: #d4edda; color: #155724; padding: 10px; margin-bottom: 15px; border: 1px solid #c3e6cb; border-radius: 4px;">
                             <?php echo htmlspecialchars($clean_message); ?>
@@ -1087,60 +1123,31 @@ try {
                         <div style="background: #d1ecf1; color: #0c5460; padding: 10px; margin-bottom: 15px; border: 1px solid #bee5eb; border-radius: 4px;">
                             <?php echo htmlspecialchars($cache_message); ?>
                         </div>
-                        <?php endif; ?>
+                        <?php endif; ?> 
                         
-                        <div class="row">
-                            <div class="col-mb-6">
-                                <h4>数据库信息</h4>
-                                <p><strong>总访问记录：</strong><?php echo number_format($db_stats['total_records']); ?> 条</p>
-                                <p><strong>最近30天记录：</strong><?php echo number_format($db_stats['recent_records']); ?> 条</p>
-                                <?php if ($db_stats['earliest_time']): ?>
-                                <p><strong>最早记录时间：</strong><?php echo date('Y-m-d H:i:s', $db_stats['earliest_time']); ?></p>
-                                <?php endif; ?>
-                                
-                                <form method="post" style="display: inline-block; margin-top: 10px;">
-                                    <input type="hidden" name="action" value="clean_records">
-                                    <label for="clean_days">清理</label>
-                                    <input type="number" name="clean_days" id="clean_days" value="30" min="1" max="365" style="width: 60px; margin: 0 5px;">
-                                    <label for="clean_days">天前的记录</label>
-                                    <button type="submit" class="btn btn-s" onclick="return confirm('确定要清理过期的访问记录吗？此操作不可恢复！')" style="margin-left: 10px;">立即清理</button>
-                                </form>
-                                <p style="margin-top: 10px; color: #666; font-size: 12px;">* 建议定期清理过期记录以节省存储空间</p>
-                            </div>
-                            <div class="col-mb-6">
-                                <h4>缓存信息</h4>
-                                <?php 
-                                $cache_file = __TYPECHO_ROOT_DIR__ . $plugin_config->cache_file;
-                                $cache_enabled = $plugin_config && $plugin_config->enable_cache == '1';
-                                ?>
-                                <p><strong>缓存状态：</strong>
-                                    <?php if ($cache_enabled): ?>
-                                        <span style="color: #28a745;">已启用</span>
-                                    <?php else: ?>
-                                        <span style="color: #dc3545;">已禁用</span>
-                                    <?php endif; ?>
-                                </p>
-                                
-                                <?php if ($cache_enabled): ?>
-                                <p><strong>缓存文件：</strong>
-                                    <?php if (file_exists($cache_file)): ?>
-                                        <span style="color: #28a745;">存在</span>
-                                        (<?php echo date('Y-m-d H:i:s', filemtime($cache_file)); ?>)
-                                    <?php else: ?>
-                                        <span style="color: #ffc107;">不存在</span>
-                                    <?php endif; ?>
-                                </p>
-                                <p><strong>缓存间隔：</strong><?php echo intval($plugin_config->cache_time); ?> 秒</p>
-                                
-                                <form method="post" style="display: inline-block; margin-top: 10px;">
-                                    <input type="hidden" name="action" value="clear_cache">
-                                    <button type="submit" class="btn btn-s" onclick="return confirm('确定要清理缓存文件吗？下次访问时将重新生成缓存。')">清理缓存</button>
-                                </form>
-                                <p style="margin-top: 10px; color: #666; font-size: 12px;">* 清理缓存后下次访问时会自动重新生成</p>
-                                <?php else: ?>
-                                <p style="color: #666;">缓存功能已禁用，可在插件配置中启用</p>
-                                <?php endif; ?>
-                            </div>
+                        <div style="float: none; width: 100%; flex: 1 1 100%; min-width: 0; max-width: 100%; margin: 0; padding: 0; box-sizing: border-box; overflow-wrap: anywhere;">
+                            <p><strong>数据库信息：</strong>总访问记录 <?php echo number_format($db_stats['total_records']); ?> 条 ｜ 最近30天记录 <?php echo number_format($db_stats['recent_records']); ?> 条<?php if ($db_stats['earliest_time']): ?> ｜ 最早记录时间 <?php echo date('Y-m-d H:i:s', $db_stats['earliest_time']); ?><?php endif; ?></p>
+                            
+                            <form method="post" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; width: 100%; max-width: 100%;">
+                                <input type="hidden" name="action" value="clean_records">
+                                <label for="clean_days">清理</label>
+                                <input type="number" name="clean_days" id="clean_days" value="30" min="1" max="365" style="width: 60px;">
+                                <label for="clean_days">天前的记录</label>
+                                <button type="submit" class="btn btn-s" onclick="return confirm('确定要清理过期的访问记录吗？此操作不可恢复！')" style="white-space: normal; max-width: 100%;">立即清理</button>
+                            </form>
+                            <p style="margin-top: 10px; color: #666; font-size: 12px;">建议定期清理过期记录以节省存储空间</p>
+                        </div>
+                        <div style="float: none; width: 100%; flex: 1 1 100%; min-width: 0; max-width: 100%; margin: 0; padding: 0; box-sizing: border-box; overflow-wrap: anywhere;">
+                            <?php 
+                            $cache_file = __TYPECHO_ROOT_DIR__ . $plugin_config->cache_file;
+                            $cache_enabled = $plugin_config && $plugin_config->enable_cache == '1';
+                            ?>
+                            <p><strong>缓存信息：</strong>缓存状态 <?php if ($cache_enabled): ?><span style="color: #28a745;">已启用</span><?php else: ?><span style="color: #dc3545;">已禁用</span><?php endif; ?><?php if ($cache_enabled): ?> ｜ 缓存文件 <?php if (file_exists($cache_file)): ?><span style="color: #28a745;">存在</span> (<?php echo date('Y-m-d H:i:s', filemtime($cache_file)); ?>)<?php else: ?><span style="color: #ffc107;">不存在</span><?php endif; ?> ｜ 缓存间隔 <?php echo intval($plugin_config->cache_time); ?> 秒<?php endif; ?></p>
+                            
+                            <?php if ($cache_enabled): ?>
+                            <form method="post" style="display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; width: 100%; max-width: 100%;"><input type="hidden" name="action" value="clear_cache"><button type="submit" class="btn btn-s" onclick="return confirm('确定要清理缓存文件吗？下次访问时将重新生成缓存。')" style="white-space: normal; max-width: 100%;">清理缓存</button></form>
+                            <p style="margin-top: 10px; color: #666; font-size: 12px;">清理缓存后下次访问时会自动重新生成</p>
+                            <?php else: ?><p style="color: #666;">缓存功能已禁用，可在插件配置中启用</p><?php endif; ?>
                         </div>
                     </div>
                 </div>
@@ -1148,16 +1155,14 @@ try {
                 <!-- IP归属地数据管理 -->
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
                     <h3>IP归属地数据管理</h3>
-                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6;">
+                    <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-wrap: anywhere;">
                         <?php if (isset($ip_clean_message)): ?>
                         <div style="background: #d4edda; color: #155724; padding: 10px; margin-bottom: 15px; border: 1px solid #c3e6cb; border-radius: 4px;">
                             <?php echo htmlspecialchars($ip_clean_message); ?>
                         </div>
                         <?php endif; ?>
                         
-                        <div class="row">
-                            <div class="col-mb-6">
-                                <h4>本地IP数据库信息</h4>
+                            <div style="float: none; width: 100%; flex: 1 1 100%; min-width: 0; max-width: 100%; margin: 0; padding: 0; box-sizing: border-box; overflow-wrap: anywhere;">
                                 <?php
                                 try {
                                     $ip_stats = $db->fetchRow($db->select('COUNT(*) as total_ips')
@@ -1173,44 +1178,15 @@ try {
                                     $oldest_ip = array('oldest_time' => null);
                                 }
                                 ?>
-                                <p><strong>总IP记录：</strong><?php echo number_format($ip_stats['total_ips']); ?> 条</p>
-                                <p><strong>最近30天新增：</strong><?php echo number_format($recent_ip_stats['recent_ips']); ?> 条</p>
-                                <?php if ($oldest_ip['oldest_time']): ?>
-                                <p><strong>最早记录时间：</strong><?php echo date('Y-m-d H:i:s', $oldest_ip['oldest_time']); ?></p>
-                                <?php endif; ?>
+                                <p><strong>本地IP数据库信息：</strong>总IP记录 <?php echo number_format($ip_stats['total_ips']); ?> 条 ｜ 最近30天新增 <?php echo number_format($recent_ip_stats['recent_ips']); ?> 条<?php if ($oldest_ip['oldest_time']): ?> ｜ 最早记录时间 <?php echo date('Y-m-d H:i:s', $oldest_ip['oldest_time']); ?><?php endif; ?></p>
                                 
-                                <div style="margin-top: 15px;">
-                                    <button onclick="loadIpLocationData(1)" class="btn btn-s" style="margin-right: 10px;">查看IP数据</button>
-                                    <form method="post" style="display: inline-block; margin-right: 10px;">
-                                        <input type="hidden" name="action" value="clean_expired_ip_data">
-                                        <label for="ip_clean_days">清理</label>
-                                        <input type="number" name="clean_days" id="ip_clean_days" value="90" min="1" max="365" style="width: 60px; margin: 0 5px;">
-                                        <label for="ip_clean_days">天前的IP数据</label>
-                                        <button type="submit" class="btn btn-s" onclick="return confirm('确定要清理过期的IP归属地数据吗？此操作不可恢复！')" style="margin-left: 10px;">清理过期数据</button>
-                                    </form>
-                                </div>
-                                <p style="margin-top: 10px; color: #666; font-size: 12px;">* 建议定期清理过期IP数据以节省存储空间</p>
+                                <div style="margin-top: 15px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;"><button onclick="loadIpLocationData(1)" class="btn btn-s" style="white-space: normal; max-width: 100%;">查看IP数据</button><form method="post" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; max-width: 100%;"><input type="hidden" name="action" value="clean_expired_ip_data"><label for="ip_clean_days">清理</label><input type="number" name="clean_days" id="ip_clean_days" value="90" min="1" max="365" style="width: 60px;"><label for="ip_clean_days">天前的IP数据</label><button type="submit" class="btn btn-s" onclick="return confirm('确定要清理过期的IP归属地数据吗？此操作不可恢复！')" style="white-space: normal; max-width: 100%;">清理过期数据</button></form></div>
+                                <p style="margin-top: 10px; color: #666; font-size: 12px;">建议定期清理过期IP数据以节省存储空间</p>
                             </div>
-                            <div class="col-mb-6">
-                                <h4>IP归属地配置</h4>
-                                <p><strong>本地数据库：</strong>
-                                    <?php if ($plugin_config && $plugin_config->enable_local_ip_db == '1'): ?>
-                                        <span style="color: #28a745;">已启用</span>
-                                    <?php else: ?>
-                                        <span style="color: #dc3545;">已禁用</span>
-                                    <?php endif; ?>
-                                </p>
-                                <p><strong>缓存天数：</strong><?php echo $plugin_config ? intval($plugin_config->ip_cache_days) : 30; ?> 天</p>
-                                <p><strong>自动清理：</strong>
-                                    <?php if ($plugin_config && $plugin_config->auto_clean_ip == '1'): ?>
-                                        <span style="color: #28a745;">已启用</span>
-                                    <?php else: ?>
-                                        <span style="color: #dc3545;">已禁用</span>
-                                    <?php endif; ?>
-                                </p>
-                                <p style="color: #666; font-size: 12px; margin-top: 15px;">* 可在插件配置中修改这些设置</p>
+                            <div style="float: none; width: 100%; flex: 1 1 100%; min-width: 0; max-width: 100%; margin: 0; padding: 0; box-sizing: border-box; overflow-wrap: anywhere;">
+                                <p><strong>IP归属地配置：</strong>本地数据库 <?php if ($plugin_config && $plugin_config->enable_local_ip_db == '1'): ?><span style="color: #28a745;">已启用</span><?php else: ?><span style="color: #dc3545;">已禁用</span><?php endif; ?> ｜ 缓存天数 <?php echo $plugin_config ? intval($plugin_config->ip_cache_days) : 30; ?> 天 ｜ 自动清理 <?php if ($plugin_config && $plugin_config->auto_clean_ip == '1'): ?><span style="color: #28a745;">已启用</span><?php else: ?><span style="color: #dc3545;">已禁用</span><?php endif; ?></p>
+                                <p style="color: #666; font-size: 12px; margin-top: 15px;">可在插件配置中修改这些设置</p>
                             </div>
-                        </div>
                     </div>
                 </div>
 
@@ -1226,12 +1202,37 @@ try {
 // 绘制访问趋势图
 function drawChart() {
     var canvas = document.getElementById('visitChart');
+    if (!canvas) return;
+
     var ctx = canvas.getContext('2d');
     var data = <?php echo json_encode($week_data); ?>;
-    
-    var width = canvas.width;
-    var height = canvas.height;
-    var padding = 40;
+
+    // 获取设备像素比,解决高DPI屏幕模糊问题
+    var dpr = window.devicePixelRatio || 1;
+
+    // 获取容器实际宽度
+    var container = canvas.parentElement;
+    var displayWidth = container.offsetWidth;
+    var displayHeight = 300;
+
+    // 根据宽度自适应调整padding和字体
+    var padding = displayWidth < 500 ? 30 : 40;
+    var fontSize = displayWidth < 500 ? 10 : 12;
+    var labelFontSize = displayWidth < 500 ? 10 : 12;
+
+    // 设置canvas实际尺寸(考虑DPI)
+    canvas.width = displayWidth * dpr;
+    canvas.height = displayHeight * dpr;
+
+    // 设置canvas显示尺寸
+    canvas.style.width = displayWidth + 'px';
+    canvas.style.height = displayHeight + 'px';
+
+    // 缩放绘图上下文以匹配DPI
+    ctx.scale(dpr, dpr);
+
+    var width = displayWidth;
+    var height = displayHeight;
     var chartWidth = width - 2 * padding;
     var chartHeight = height - 2 * padding;
     
@@ -1247,7 +1248,9 @@ function drawChart() {
     }
     
     // 找出最大值
-    var maxValue = Math.max.apply(Math, data.map(function(item) { return item.visits; }));
+    var maxRealUsers = Math.max.apply(Math, data.map(function(item) { return item.real_users || 0; }));
+    var maxBots = Math.max.apply(Math, data.map(function(item) { return item.bots || 0; }));
+    var maxValue = Math.max(maxRealUsers, maxBots);
     if (maxValue === 0) maxValue = 1;
     
     // 绘制坐标轴
@@ -1270,14 +1273,31 @@ function drawChart() {
         ctx.stroke();
     }
     
-    // 绘制连线
+    // 绘制非蜘蛛数折线图（真实用户访问量）
     ctx.strokeStyle = '#467b96';
     ctx.lineWidth = 2;
     ctx.beginPath();
     
     for (var i = 0; i < data.length; i++) {
         var x = padding + (i * chartWidth / (data.length - 1));
-        var y = height - padding - (data[i].visits / maxValue * chartHeight);
+        var y = height - padding - ((data[i].real_users || 0) / maxValue * chartHeight);
+        
+        if (i === 0) {
+            ctx.moveTo(x, y);
+        } else {
+            ctx.lineTo(x, y);
+        }
+    }
+    ctx.stroke();
+    
+    // 绘制蜘蛛数折线图
+    ctx.strokeStyle = '#ff6b35';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    
+    for (var i = 0; i < data.length; i++) {
+        var x = padding + (i * chartWidth / (data.length - 1));
+        var y = height - padding - ((data[i].bots || 0) / maxValue * chartHeight);
         
         if (i === 0) {
             ctx.moveTo(x, y);
@@ -1290,7 +1310,7 @@ function drawChart() {
     // 绘制数据点和标签
     for (var i = 0; i < data.length; i++) {
         var x = padding + (i * chartWidth / (data.length - 1));
-        var y = height - padding - (data[i].visits / maxValue * chartHeight);
+        var y = height - padding - ((data[i].real_users || 0) / maxValue * chartHeight);
         
         // 判断是否为周末
         var isWeekend = false;
@@ -1300,7 +1320,7 @@ function drawChart() {
             isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
         }
         
-        // 绘制数据点 - 周末标红，工作日用蓝色
+        // 绘制非蜘蛛数据点 - 周末标红，工作日用蓝色
         ctx.fillStyle = isWeekend ? '#ff0000' : '#467b96';
         ctx.beginPath();
         ctx.arc(x, y, 4, 0, 2 * Math.PI);
@@ -1308,40 +1328,82 @@ function drawChart() {
         
         // 绘制日期标签 - 周末标红，工作日用灰色
         ctx.fillStyle = isWeekend ? '#ff0000' : '#666';
-        ctx.font = '12px Arial';
+        ctx.font = fontSize + 'px Arial';
         ctx.textAlign = 'center';
-        ctx.fillText(data[i].date, x, height - padding + 15);
-        
-        // 绘制数值标签 - 周末标红，工作日用蓝色
+        ctx.fillText(data[i].date.split('-')[1], x, height - padding + 15);
+
+        // 绘制非蜘蛛数值标签 - 周末标红，工作日用蓝色
         ctx.fillStyle = isWeekend ? '#ff0000' : '#467b96';
-        ctx.fillText(data[i].visits, x, y - 10);
+        ctx.fillText(data[i].real_users || 0, x, y - 10);
+        
+        // 绘制蜘蛛数据点
+        var botY = height - padding - ((data[i].bots || 0) / maxValue * chartHeight);
+        ctx.fillStyle = '#ff6b35';
+        ctx.beginPath();
+        ctx.arc(x, botY, 3, 0, 2 * Math.PI);
+        ctx.fill();
+        
+        // 绘制蜘蛛数值标签
+        ctx.fillStyle = '#ff6b35';
+        ctx.fillText(data[i].bots || 0, x, botY - 10);
     }
     
     // 绘制图例
     var legendY = padding - 20;
-    
+
+    // 非蜘蛛数图例
+    ctx.fillStyle = '#467b96';
+    ctx.font = labelFontSize + 'px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText('● 非蜘蛛数', padding, legendY + 4);
+
+    // 蜘蛛数图例
+    ctx.fillStyle = '#ff6b35';
+    ctx.fillText('● 蜘蛛数', padding + 80, legendY + 4);
+
     // 工作日图例
     ctx.fillStyle = '#666';
-    ctx.font = '12px Arial';
-    ctx.textAlign = 'left';
-    ctx.fillText('工作日', padding + 50, legendY + 4);
-    
+    ctx.fillText('工作日', padding + 160, legendY + 4);
+
     // 周末图例
     ctx.fillStyle = '#ff0000';
-    ctx.fillText('周末', padding + 100, legendY + 4);
+    ctx.fillText('周末', padding + 210, legendY + 4);
 }
 
 // 绘制月度访问统计图
 function drawMonthlyChart() {
     var canvas = document.getElementById('monthlyChart');
     if (!canvas) return;
-    
+
     var ctx = canvas.getContext('2d');
     var data = <?php echo json_encode($monthly_stats); ?>;
-    
-    var width = canvas.width;
-    var height = canvas.height;
-    var padding = 50;
+
+    // 获取设备像素比,解决高DPI屏幕模糊问题
+    var dpr = window.devicePixelRatio || 1;
+
+    // 获取容器实际宽度
+    var container = canvas.parentElement;
+    var displayWidth = container.offsetWidth;
+    var displayHeight = 300;
+
+    // 根据宽度自适应调整padding和字体
+    var padding = displayWidth < 500 ? 35 : 50;
+    var fontSize = displayWidth < 500 ? 10 : 11;
+    var labelFontSize = displayWidth < 500 ? 10 : 12;
+
+    // 设置canvas实际尺寸(考虑DPI)
+    canvas.width = displayWidth * dpr;
+    canvas.height = displayHeight * dpr;
+
+    // 设置canvas显示尺寸
+    canvas.style.width = displayWidth + 'px';
+    canvas.style.height = displayHeight + 'px';
+
+    // 缩放绘图上下文以匹配DPI
+    ctx.scale(dpr, dpr);
+
+    var width = displayWidth;
+    var height = displayHeight;
     var chartWidth = width - 2 * padding;
     var chartHeight = height - 2 * padding;
     
@@ -1382,7 +1444,7 @@ function drawMonthlyChart() {
         
         // 绘制Y轴标签
         ctx.fillStyle = '#666';
-        ctx.font = '12px Arial';
+        ctx.font = fontSize + 'px Arial';
         ctx.textAlign = 'right';
         var value = Math.round(maxValue * (5 - i) / 5);
         ctx.fillText(value.toString(), padding - 10, y + 4);
@@ -1421,14 +1483,14 @@ function drawMonthlyChart() {
         
         // 绘制月份标签
         ctx.fillStyle = '#666';
-        ctx.font = '11px Arial';
+        ctx.font = fontSize + 'px Arial';
         ctx.textAlign = 'center';
-        var monthLabel = data[i].year_month.split('-')[1] + '月';
+        var monthLabel = data[i].year_month.split('-')[1];
         ctx.fillText(monthLabel, x, height - padding + 15);
-        
+
         // 绘制数值标签
         ctx.fillStyle = '#28a745';
-        ctx.font = 'bold 11px Arial';
+        ctx.font = 'bold ' + fontSize + 'px Arial';
         ctx.fillText(visits.toString(), x, y - 10);
         ctx.fillStyle = '#28a745';
     }
@@ -1475,10 +1537,10 @@ function drawMonthlyChart() {
     ctx.fillStyle = '#28a745';
     ctx.fillRect(padding, legendY, 15, 3);
     ctx.fillStyle = '#333';
-    ctx.font = '12px Arial';
+    ctx.font = labelFontSize + 'px Arial';
     ctx.textAlign = 'left';
     ctx.fillText('总访问量', padding + 20, legendY + 10);
-    
+
     ctx.strokeStyle = '#17a2b8';
     ctx.lineWidth = 2;
     ctx.setLineDash([5, 5]);
@@ -1501,6 +1563,16 @@ if (document.readyState === 'loading') {
     drawChart();
     drawMonthlyChart();
 }
+
+// 窗口大小变化时重绘图表
+var resizeTimer;
+window.addEventListener('resize', function() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() {
+        drawChart();
+        drawMonthlyChart();
+    }, 250);
+});
 
 // 显示访问记录模态框
 function showVisitRecords(cid, title) {
