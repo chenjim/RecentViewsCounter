@@ -1,5 +1,6 @@
 <?php
 if (!defined('__TYPECHO_ROOT_DIR__')) exit;
+require_once dirname(__FILE__) . '/Blacklist.php';
 
 // 包含管理后台公共文件
 include_once __TYPECHO_ROOT_DIR__ . '/admin/common.php';
@@ -11,40 +12,37 @@ $options = Typecho_Widget::widget('Widget_Options');
 $plugin_config = $options->plugin('RecentViewsCounter');
 $top_count = $plugin_config ? intval($plugin_config->top_count) : 10;
 
-// 获取蜘蛛检测模式数组（复用函数）
-function getBotPatterns() {
-    return array(
-        'Googlebot', 'Bingbot', 'Slurp', 'DuckDuckBot', 'Baiduspider',
-        'YandexBot', 'YandexAccessibilityBot', 'YandexMobileBot', 'YandexDirectDyn',
-        'facebookexternalhit', 'Twitterbot', 'rogerbot', 'linkedinbot',
-        'embedly', 'quora link preview', 'showyoubot', 'outbrain', 'pinterest',
-        'developers.google.com/+/web/snippet', 'slackbot', 'vkShare',
-        'W3C_Validator', 'redditbot', 'Applebot', 'WhatsApp', 'flipboard',
-        'tumblr', 'bitlybot', 'SkypeUriPreview', 'nuzzel', 'Discordbot',
-        'Google Page Speed', 'Qwantify', 'pinterestbot', 'Bitrix link preview',
-        'XING-contenttabreceiver', 'Chrome-Lighthouse', 'TelegramBot',
-        'SemrushBot', 'AhrefsBot', 'MJ12bot', 'DotBot', 'Mediapartners-Google',
-        'AdsBot-Google', 'Googlebot-News', 'Googlebot-Image', 'Googlebot-Video',
-        'Googlebot-Mobile', 'msnbot', 'bingbot', 'ia_archiver', 'Wayback',
-        'archive.org_bot', 'CCBot', 'SeznamBot', 'MojeekBot', 'DuckDuckGo-Favicons-Bot',
-        // 中国搜索引擎爬虫
-        'Baiduspider-render', 'Baiduspider-image', 'Baiduspider-news', 'Baiduspider-video',
-        'Sogou web spider', 'Sogou News Spider', 'Sogou Pic Spider', 'Sogou Video Spider',
-        'HaoSouSpider', '360Spider', 'JikeSpider', 'YisouSpider', 'ToutiaoSpider',
-        'ByteSpider', 'PetalBot', 'spider', 'crawler', 'bot'
-    );
+/**
+ * 解析时间范围参数，返回天数（null表示全部时间）
+ */
+function parseTimeRangeDays($range) {
+    if ($range === '7') return 7;
+    if ($range === '30') return 30;
+    return null;
+}
+
+// CSRF 保护：对修改数据的 POST 请求校验 Referer
+$request = Typecho_Request::getInstance();
+if ($request->isPost()) {
+    $destructiveActions = array('clean_records', 'clear_cache', 'clean_expired_ip_data', 'delete_ip_location', 'add_to_blacklist', 'remove_from_blacklist', 'get_blacklist');
+    if (in_array($request->get('action'), $destructiveActions)) {
+        $siteHost = parse_url($options->siteUrl, PHP_URL_HOST);
+        $refererHost = $request->getReferer() ? parse_url($request->getReferer(), PHP_URL_HOST) : null;
+        if (!$refererHost || $refererHost !== $siteHost) {
+            die('Forbidden');
+        }
+    }
 }
 
 // 智能Bot检测说明内容（复用）
+$threshold = RecentViewsCounter_Plugin::BOT_THRESHOLD;
 $bot_detection_info = "智能Bot检测说明：
 基于多维度分析(User-Agent识别、访问频率、行为模式等)。
 评分规则：
 • UA识别40分、高频访问20分、专注爬取15分
-• 空UA10分、单一UA10分、高频率5分
-风险等级：
-• 0-29分正常用户
-• 30-59分疑似Bot
-• 60+分高风险Bot";
+• 单一UA25分、高频率10分
+判定条件：UA匹配 或 行为评分 ≥{$threshold}分 即标记为Bot
+(注意：TOP 20表显示的是纯行为评分，不含UA识别分)";
 
 // 处理手动清理请求
 if (isset($_POST['action']) && $_POST['action'] == 'clean_records') {
@@ -67,6 +65,47 @@ if (isset($_POST['action']) && $_POST['action'] == 'clear_cache') {
     } else {
         $cache_message = "缓存文件不存在";
     }
+}
+
+// 处理黑名单 AJAX 请求
+if (isset($_POST['action']) && $_POST['action'] === 'get_blacklist') {
+    if (ob_get_level()) ob_clean();
+    $page = isset($_POST['page']) ? intval($_POST['page']) : 1;
+    $limit = isset($_POST['limit']) ? intval($_POST['limit']) : 20;
+    $result = RecentViewsCounter_Blacklist::getList($page, $limit);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array(
+        'success' => true,
+        'data' => $result['data'],
+        'total' => $result['total'],
+        'page' => $page,
+        'limit' => $limit
+    ), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'add_to_blacklist') {
+    if (ob_get_level()) ob_clean();
+    $ip = isset($_POST['ip']) ? trim($_POST['ip']) : '';
+    $reason = isset($_POST['reason']) ? trim($_POST['reason']) : '';
+    $ok = RecentViewsCounter_Blacklist::add($ip, $reason);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array(
+        'success' => $ok,
+        'message' => $ok ? 'IP 已加入黑名单' : 'IP 已存在或添加失败'
+    ), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'remove_from_blacklist') {
+    if (ob_get_level()) ob_clean();
+    $ip = isset($_POST['ip']) ? trim($_POST['ip']) : '';
+    if (!empty($ip)) {
+        RecentViewsCounter_Blacklist::remove($ip);
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array('success' => true, 'message' => 'IP 已从黑名单移除'), JSON_UNESCAPED_UNICODE);
+    exit;
 }
 
 // 处理获取访问记录请求
@@ -131,7 +170,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'get_ip_visit_details') {
                                        ->join('table.contents c', 'vr.cid = c.cid', Typecho_Db::LEFT_JOIN)
                                        ->where('vr.ip = ?', $ip)
                                        ->order('vr.visit_time', Typecho_Db::SORT_DESC)
-                                       ->limit(200));
+                                  ->limit(500));
             
             // 确保数据格式正确
             if (!$records) {
@@ -289,18 +328,7 @@ $db_stats = RecentViewsCounter_Plugin::getDatabaseStats();
 // 获取热门文章的时间范围参数（优先使用统一参数）
 $article_time_range = isset($_GET['article_time_range']) ? $_GET['article_time_range'] : 
                      (isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7');
-$article_days = 30; // 默认30天
-switch ($article_time_range) {
-    case '7':
-        $article_days = 7;
-        break;
-    case '30':
-        $article_days = 30;
-        break;
-    default:
-        $article_days = null; // 全部时间
-        break;
-}
+$article_days = parseTimeRangeDays($article_time_range);
 
 // 获取热门文章
 if ($article_days) {
@@ -340,128 +368,140 @@ if ($article_days) {
 // 获取统一时间范围参数（优先从location_time_range获取，因为changeGlobalTimeRange函数会设置这个参数）
 // 注意：当选择7天时，JavaScript会删除URL参数，所以没有参数时默认为7天
 $global_time_range = isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7';
-$global_time_condition = null;
-switch ($global_time_range) {
-    case '7':
-    case '':
-    case null:
-        $global_time_condition = time() - 7 * 24 * 3600;
-        break;
-    case '30':
-        $global_time_condition = time() - 30 * 24 * 3600;
-        break;
-    case 'all':
-        $global_time_condition = null; // 全部时间
-        break;
-    default:
-        $global_time_condition = time() - 7 * 24 * 3600; // 默认7天
-        break;
+$global_days = parseTimeRangeDays($global_time_range);
+$global_time_condition = $global_days ? time() - $global_days * 86400 : null;
+
+// 计算Bot IP列表（用于过滤统计概览）
+// 规则：命中Bot UA 或 行为评分超过阈值即标记为Bot
+$bot_ip_list = array();
+$bot_ip_where = '';
+try {
+    $prefix = $db->getPrefix();
+    // 查询该时间窗口内匹配Bot UA的IP
+    $bot_conds = array();
+    foreach (RecentViewsCounter_Plugin::getBotPatterns() as $p) {
+        $bot_conds[] = "LOWER(user_agent) LIKE '%" . strtolower($p) . "%'";
+    }
+    $ua_sql = "SELECT DISTINCT ip FROM {$prefix}views_records WHERE (" . implode(' OR ', $bot_conds) . ")";
+    if ($global_time_condition !== null) {
+        $ua_sql .= " AND visit_time > " . intval($global_time_condition);
+    }
+    $ua_bot_ips = array();
+    foreach ($db->fetchAll($db->query($ua_sql)) as $r) {
+        $ua_bot_ips[$r['ip']] = true;
+    }
+
+    // 查询行为评分
+    $ip_query = $db->select('ip',
+        array('COUNT(*)' => 'cnt'),
+        array('COUNT(DISTINCT cid)' => 'distinct_cids'),
+        array('COUNT(DISTINCT user_agent)' => 'ua_variety'),
+        array('MIN(visit_time)' => 'first_visit'),
+        array('MAX(visit_time)' => 'last_visit'))
+        ->from('table.views_records');
+    if ($global_time_condition !== null) {
+        $ip_query = $ip_query->where('visit_time > ?', $global_time_condition);
+    }
+    $ip_aggs = $db->fetchAll($ip_query->group('ip'));
+    foreach ($ip_aggs as $ip_agg) {
+        $score = 0;
+        if ($ip_agg['cnt'] > 50) $score += 20;
+        $focus_ratio = $ip_agg['cnt'] > 0 ? $ip_agg['distinct_cids'] / $ip_agg['cnt'] : 1;
+        if ($focus_ratio < 0.3 && $ip_agg['cnt'] > 10) $score += 15;
+        if ($ip_agg['ua_variety'] == 1 && $ip_agg['cnt'] > 5) $score += 25;
+        $visit_duration = $ip_agg['last_visit'] - $ip_agg['first_visit'];
+        $rate = $visit_duration > 0 ? $ip_agg['cnt'] / ($visit_duration / 3600) : 0;
+        if ($rate > 5) $score += 10;
+        // 命中Bot UA或行为评分≥60才标记
+        if (isset($ua_bot_ips[$ip_agg['ip']]) || $score >= RecentViewsCounter_Plugin::BOT_THRESHOLD) {
+            $bot_ip_list[] = $ip_agg['ip'];
+        }
+    }
+    if (!empty($bot_ip_list)) {
+        $escaped_ips = array();
+        foreach ($bot_ip_list as $bot_ip) {
+            $escaped_ips[] = "'" . str_replace("'", "''", $bot_ip) . "'";
+        }
+        $bot_ip_where = ' AND ip NOT IN (' . implode(',', $escaped_ips) . ')';
+    }
+} catch (Exception $e) {
+    $bot_ip_list = array();
 }
 
-// 调试信息（可以在测试后删除）
-echo "<!-- 调试信息: global_time_range = $global_time_range, global_time_condition = " . ($global_time_condition ? date('Y-m-d H:i:s', $global_time_condition) : 'null') . " -->";
-
-// 获取总访问量统计
+// 获取总访问量（排除行为检测Bot）
 try {
-    $query = $db->select('COUNT(*) as count')->from('table.views_records');
+    $prefix = $db->getPrefix();
+    $sql = "SELECT COUNT(*) as count FROM {$prefix}views_records WHERE 1=1";
     if ($global_time_condition !== null) {
-        $query = $query->where('visit_time > ?', $global_time_condition);
+        $sql .= " AND visit_time > " . intval($global_time_condition);
     }
-    $total_visits = $db->fetchRow($query);
+    $sql .= $bot_ip_where;
+    $total_visits = $db->fetchRow($db->query($sql));
 } catch (Exception $e) {
     $total_visits = array('count' => 0);
 }
 
-// 获取独立访客数
-try {
-    $query = $db->select('COUNT(DISTINCT ip) as count')->from('table.views_records');
-    if ($global_time_condition !== null) {
-        $query = $query->where('visit_time > ?', $global_time_condition);
-    }
-    $unique_visitors = $db->fetchRow($query);
-} catch (Exception $e) {
-    $unique_visitors = array('count' => 0);
-}
-
-// 获取今日访问量
+// 获取今日访问量（排除行为检测Bot）
 $today_start = strtotime(date('Y-m-d 00:00:00'));
 try {
-    $today_visits = $db->fetchRow($db->select('COUNT(*) as count')
-                                    ->from('table.views_records')
-                                    ->where('visit_time > ?', $today_start));
+    $prefix = $db->getPrefix();
+    $sql = "SELECT COUNT(*) as count FROM {$prefix}views_records WHERE visit_time > " . intval($today_start) . $bot_ip_where;
+    $today_visits = $db->fetchRow($db->query($sql));
 } catch (Exception $e) {
     $today_visits = array('count' => 0);
 }
 
-// 获取访问来源统计的时间范围参数（优先使用统一参数）
-$referer_time_range = isset($_GET['referer_time_range']) ? $_GET['referer_time_range'] : 
-                     (isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7');
+// 获取Bot IP的总访问量（用于"总蜘蛛数"）
+$total_bots_data = array('count' => 0);
+if (!empty($bot_ip_list)) {
+    try {
+        $prefix = $db->getPrefix();
+        $escaped_bot_ips = array();
+        foreach ($bot_ip_list as $bot_ip) {
+            $escaped_bot_ips[] = "'" . str_replace("'", "''", $bot_ip) . "'";
+        }
+        $sql = "SELECT COUNT(*) as count FROM {$prefix}views_records WHERE 1=1";
+        if ($global_time_condition !== null) {
+            $sql .= " AND visit_time > " . intval($global_time_condition);
+        }
+        $sql .= ' AND ip IN (' . implode(',', $escaped_bot_ips) . ')';
+        $total_bots_data = $db->fetchRow($db->query($sql));
+    } catch (Exception $e) {
+        $total_bots_data = array('count' => 0);
+    }
+}
+
+// 获取IP数统计
+$bot_ip_count = count($bot_ip_list);
+$total_distinct_ips = 0;
+try {
+    $prefix = $db->getPrefix();
+    $sql = "SELECT COUNT(DISTINCT ip) as count FROM {$prefix}views_records WHERE 1=1";
+    if ($global_time_condition !== null) {
+        $sql .= " AND visit_time > " . intval($global_time_condition);
+    }
+    $r = $db->fetchRow($db->query($sql));
+    $total_distinct_ips = $r ? intval($r['count']) : 0;
+} catch (Exception $e) {
+    $total_distinct_ips = 0;
+}
+$non_bot_ip_count = max(0, $total_distinct_ips - $bot_ip_count);
 
 // 获取访问来源统计数据
 $referer_stats = array();
 if ($plugin_config && $plugin_config->enable_referer == '1') {
-    // 根据时间范围参数确定统计天数
-    switch ($referer_time_range) {
-        case '7':
-            $stats_days = 7;
-            break;
-        case '30':
-            $stats_days = 30;
-            break;
-        case 'all':
-            $stats_days = 365 * 10; // 10年，相当于全部
-            break;
-        default:
-            $stats_days = 7; // 默认7天
-    }
+    $referer_time_range = isset($_GET['referer_time_range']) ? $_GET['referer_time_range'] : 
+                         (isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7');
+    $stats_days = parseTimeRangeDays($referer_time_range) ?? 3650;
     $referer_stats = RecentViewsCounter_Plugin::getRefererStats($stats_days);
 }
 
-// 获取总蜘蛛数（通过User-Agent识别）
-$bot_patterns = getBotPatterns();
-
-// 使用原生SQL统计bot访问量，确保时间条件和bot条件都正确应用
-try {
-    // 构建bot检测条件
-    $bot_conditions = array();
-    foreach ($bot_patterns as $pattern) {
-        // 使用addslashes进行简单转义，防止SQL注入
-        $escaped_pattern = addslashes($pattern);
-        $bot_conditions[] = "user_agent LIKE '%" . $escaped_pattern . "%'";
-    }
-    
-    // 构建完整的SQL查询
-    $sql = "SELECT COUNT(*) as count FROM " . $db->getPrefix() . "views_records WHERE 1=1";
-    
-    // 添加时间条件
-    if ($global_time_condition !== null) {
-        $sql .= " AND visit_time > " . intval($global_time_condition);
-    }
-    
-    // 添加bot条件（用括号包围OR条件）
-    if (!empty($bot_conditions)) {
-        $sql .= " AND (" . implode(' OR ', $bot_conditions) . ")";
-    }
-    
-    $total_bots = $db->fetchRow($db->query($sql));
-} catch (Exception $e) {
-    $total_bots = array('count' => 0);
-}
+$bot_patterns = RecentViewsCounter_Plugin::getBotPatterns();
 
 // 获取地域分布统计的时间范围参数
 $location_time_range = isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7';
-$location_time_condition = '';
-switch ($location_time_range) {
-    case '7':
-        $location_time_condition = ' AND `visit_time` > ' . (time() - 7 * 24 * 3600);
-        break;
-    case '30':
-        $location_time_condition = ' AND `visit_time` > ' . (time() - 30 * 24 * 3600);
-        break;
-    default:
-        $location_time_condition = '';
-        break;
-}
+$loc_days = parseTimeRangeDays($location_time_range);
+$location_time_condition = $loc_days ? ' AND `visit_time` > ' . (time() - $loc_days * 86400) : '';
 
 // 获取访问者地域分布统计
 try {
@@ -485,6 +525,8 @@ if (empty($monthly_stats)) {
     }
 }
 
+
+
 // 获取访问最多的IP统计，同时检查是否为bot（复用bot_patterns数组）
 $bot_regex_patterns = array();
 foreach ($bot_patterns as $pattern) {
@@ -495,18 +537,8 @@ $bot_regex = '(' . implode('|', $bot_regex_patterns) . ')';
 // 获取时间范围参数（优先使用统一参数）
 $ip_time_range = isset($_GET['ip_time_range']) ? $_GET['ip_time_range'] : 
                 (isset($_GET['location_time_range']) ? $_GET['location_time_range'] : '7');
-$time_condition = '';
-switch ($ip_time_range) {
-    case '7':
-        $time_condition = time() - 7 * 24 * 3600;
-        break;
-    case '30':
-        $time_condition = time() - 30 * 24 * 3600;
-        break;
-    default:
-        $time_condition = null;
-        break;
-}
+$ip_days = parseTimeRangeDays($ip_time_range);
+$time_condition = $ip_days ? time() - $ip_days * 86400 : null;
 
 // 高级bot检测：基于访问频率和行为模式
 try {
@@ -517,6 +549,7 @@ try {
                         array('COUNT(DISTINCT user_agent)' => 'ua_variety'),
                         array('MIN(visit_time)' => 'first_visit'),
                         array('MAX(visit_time)' => 'last_visit'),
+                        array('MIN(user_agent)' => 'sample_user_agent_min'),
                         array('MAX(user_agent)' => 'sample_user_agent'))
                 ->from('table.views_records');
     
@@ -527,100 +560,227 @@ try {
     
     $top_ips = $db->fetchAll($query->group('ip')
                                   ->order('count', Typecho_Db::SORT_DESC)
-                                  ->limit(20));
+                                  ->limit(200));
 } catch (Exception $e) {
     $top_ips = array();
 }
 
-// 为每个IP计算综合bot评分
-foreach ($top_ips as &$ip_data) {
-    $bot_score = 0;
-    
-    // User-Agent检测 (权重: 40)
-    $sample_ua = $ip_data['sample_user_agent'] ?: '';
-    $detected_bot_name = '';
-    foreach ($bot_patterns as $pattern) {
-        if (stripos($sample_ua, $pattern) !== false) {
-            $bot_score += 40;
-            $detected_bot_name = $pattern;
-            break;
+// 获取每个IP的Bot UA匹配数（替代仅依赖MAX(user_agent)的采样方式）
+$bot_ua_counts = array();
+if (!empty($top_ips)) {
+    try {
+        $prefix = $db->getPrefix();
+        $bot_conditions = array();
+        foreach ($bot_patterns as $pattern) {
+            $bot_conditions[] = "LOWER(user_agent) LIKE '%" . strtolower($pattern) . "%'";
         }
+        $bot_sql = "SELECT ip, COUNT(*) as bot_count FROM {$prefix}views_records WHERE (" . implode(' OR ', $bot_conditions) . ")";
+        if ($time_condition !== null) {
+            $bot_sql .= " AND visit_time >= " . intval($time_condition);
+        }
+        $bot_sql .= " GROUP BY ip";
+        $bot_results = $db->fetchAll($db->query($bot_sql));
+        foreach ($bot_results as $row) {
+            $bot_ua_counts[$row['ip']] = intval($row['bot_count']);
+        }
+    } catch (Exception $e) {
+        error_log('RecentViewsCounter: Bot UA count query failed: ' . $e->getMessage());
     }
-    
-    // 高频访问检测 (权重: 20)
-    if ($ip_data['count'] > 100) $bot_score += 20;
-    
-    // 专注爬取检测 (权重: 15)
-    $focus_ratio = $ip_data['count'] > 0 ? $ip_data['distinct_cids'] / $ip_data['count'] : 1;
-    if ($focus_ratio < 0.1 && $ip_data['count'] > 20) $bot_score += 15;
-    
-    // User-Agent多样性检测 (权重: 25)
-    if ($ip_data['ua_variety'] == 1 && $ip_data['count'] > 10) $bot_score += 25;
-    
-    // 访问时间模式检测 (权重: 10)
-    $visit_duration = $ip_data['last_visit'] - $ip_data['first_visit'];
-    $visit_rate = $visit_duration > 0 ? $ip_data['count'] / ($visit_duration / 3600) : 0; // 每小时访问次数
-    if ($visit_rate > 10) $bot_score += 10; // 每小时超过10次访问
-    
-    $ip_data['bot_score'] = $bot_score;
-    $ip_data['is_bot'] = ($bot_score >= 30) ? 1 : 0; // 30分以上认为是bot
-    $ip_data['is_bot_ua'] = $bot_score >= 40 ? 1 : 0;
-    $ip_data['detected_bot_name'] = $detected_bot_name; // 存储检测到的bot名称
-    $ip_data['is_high_frequency'] = $ip_data['count'] > 100 ? 1 : 0;
-    $ip_data['is_focused_crawler'] = ($focus_ratio < 0.1 && $ip_data['count'] > 20) ? 1 : 0;
 }
 
-// 获取访问趋势数据（不受全局时间选择限制，显示最近30天）
-$week_data = array();
-
-// 获取最近30天的访问趋势数据
-try {
-    $thirty_days_ago = time() - 30 * 24 * 3600;
-    $query = $db->select('visit_time, user_agent')->from('table.views_records')
-                ->where('visit_time > ?', $thirty_days_ago);
+// 为每个IP计算综合bot评分
+foreach ($top_ips as &$ip_data) {
+    $behavioral_score = 0;
     
-    $records = $db->fetchAll($query->order('visit_time', Typecho_Db::SORT_ASC));
-    
-    // Bot检测模式数组（复用）
-     $bot_patterns = getBotPatterns();
-    
-    // 在PHP中按天分组，同时统计蜘蛛访问
-    $grouped_stats = array();
-    $grouped_bots = array();
-    foreach ($records as $record) {
-        $date = date('Y-m-d', $record['visit_time']);
-        if (!isset($grouped_stats[$date])) {
-            $grouped_stats[$date] = 0;
-            $grouped_bots[$date] = 0;
-        }
-        $grouped_stats[$date]++;
-        
-        // 检测是否为蜘蛛
-        $is_bot = false;
-        $user_agent = strtolower($record['user_agent']);
-        foreach ($bot_patterns as $pattern) {
-            if (strpos($user_agent, strtolower($pattern)) !== false) {
-                $is_bot = true;
-                break;
+    $bot_ua_count = isset($bot_ua_counts[$ip_data['ip']]) ? $bot_ua_counts[$ip_data['ip']] : 0;
+    $detected_bot_name = '';
+    if ($bot_ua_count > 0) {
+        $uas_to_check = array($ip_data['sample_user_agent'] ?: '', $ip_data['sample_user_agent_min'] ?: '');
+        foreach ($uas_to_check as $ua) {
+            foreach ($bot_patterns as $pattern) {
+                if (stripos($ua, $pattern) !== false) {
+                    $detected_bot_name = $pattern;
+                    break 2;
+                }
             }
         }
-        if ($is_bot) {
-            $grouped_bots[$date]++;
+        if (empty($detected_bot_name)) {
+            $detected_bot_name = 'Bot';
         }
     }
     
-    // 转换为图表数据格式
-    foreach ($grouped_stats as $date => $count) {
-        $bot_count = intval($grouped_bots[$date]);
-        $daily_visits = intval($count); // 修改变量名避免与总访问量变量冲突
-        $real_users = $daily_visits - $bot_count; // 非蜘蛛数（真实用户访问量）
-        
+    // 行为评分（不含UA匹配）
+    if ($ip_data['count'] > 50) $behavioral_score += 20;
+    $focus_ratio = $ip_data['count'] > 0 ? $ip_data['distinct_cids'] / $ip_data['count'] : 1;
+    if ($focus_ratio < 0.3 && $ip_data['count'] > 10) $behavioral_score += 15;
+    if ($ip_data['ua_variety'] == 1 && $ip_data['count'] > 5) $behavioral_score += 25;
+    $visit_duration = $ip_data['last_visit'] - $ip_data['first_visit'];
+    $visit_rate = $visit_duration > 0 ? $ip_data['count'] / ($visit_duration / 3600) : 0;
+    if ($visit_rate > 5) $behavioral_score += 10;
+    
+    $ip_data['bot_score'] = ($bot_ua_count > 0 ? 40 : 0) + $behavioral_score;
+    $ip_data['is_bot'] = ($bot_ua_count > 0 || $behavioral_score >= RecentViewsCounter_Plugin::BOT_THRESHOLD) ? 1 : 0;
+    $ip_data['is_bot_ua'] = ($bot_ua_count > 0) ? 1 : 0;
+    $ip_data['detected_bot_name'] = $detected_bot_name;
+    $ip_data['is_high_frequency'] = $ip_data['count'] > 50 ? 1 : 0;
+    $ip_data['is_focused_crawler'] = ($focus_ratio < 0.3 && $ip_data['count'] > 10) ? 1 : 0;
+}
+
+// 补全未能通过MIN/MAX UA采样识别出具体Bot名称的IP
+$need_name_ips = array();
+foreach ($top_ips as &$ip_data) {
+    if ($ip_data['is_bot_ua'] && $ip_data['detected_bot_name'] === 'Bot') {
+        $need_name_ips[] = $ip_data['ip'];
+    }
+}
+if (!empty($need_name_ips)) {
+    try {
+        $prefix = $db->getPrefix();
+        $esc_ips = array();
+        foreach ($need_name_ips as $ip) {
+            $esc_ips[] = "'" . str_replace("'", "''", $ip) . "'";
+        }
+        $ua_samples = $db->fetchAll($db->query("SELECT ip, user_agent FROM {$prefix}views_records WHERE ip IN (" . implode(',', $esc_ips) . ") GROUP BY ip, user_agent"));
+        $ip_names = array();
+        foreach ($ua_samples as $s) {
+            $ip = $s['ip'];
+            if (isset($ip_names[$ip])) continue;
+            $ua = $s['user_agent'] ?: '';
+            foreach ($bot_patterns as $pattern) {
+                if (stripos($ua, $pattern) !== false) {
+                    $ip_names[$ip] = $pattern;
+                    break;
+                }
+            }
+        }
+        foreach ($top_ips as &$ip_data) {
+            if (isset($ip_names[$ip_data['ip']])) {
+                $ip_data['detected_bot_name'] = $ip_names[$ip_data['ip']];
+            }
+        }
+    } catch (Exception $e) {
+        // 静默失败，保留现有名称
+    }
+}
+
+// 加载黑名单IP列表，标记每个IP的黑名单状态
+try {
+    RecentViewsCounter_Blacklist::createTable();
+} catch (Exception $e) {}
+$blacklisted_ips = array();
+try {
+    $bl_result = RecentViewsCounter_Blacklist::getList(1, 99999);
+    foreach ($bl_result['data'] as $bl_item) {
+        $blacklisted_ips[$bl_item['ip']] = true;
+    }
+} catch (Exception $e) {}
+
+// 首次加载黑名单列表数据（分页）
+try {
+    $blacklist_result = RecentViewsCounter_Blacklist::getList(1, 20);
+    $blacklist_total = $blacklist_result['total'];
+} catch (Throwable $e) {
+    $blacklist_result = array('data' => array(), 'total' => 0);
+    $blacklist_total = 0;
+}
+
+foreach ($top_ips as &$ip_data) {
+    $ip_data['is_blacklisted'] = isset($blacklisted_ips[$ip_data['ip']]) ? 1 : 0;
+}
+unset($ip_data);
+
+// 提取非Bot TOP 20用于切换显示
+$non_bot_top_ips = array();
+foreach ($top_ips as $ip_data) {
+    if (!$ip_data['is_bot']) {
+        $non_bot_top_ips[] = $ip_data;
+        if (count($non_bot_top_ips) >= 20) break;
+    }
+}
+
+// "全部"视图保留前20条
+$display_top_ips = array_slice($top_ips, 0, 20);
+
+// 获取访问趋势数据（不受全局时间选择限制，固定最近30天）
+$week_data = array();
+
+try {
+    $thirty_days_ago = time() - 30 * 24 * 3600;
+    $prefix = $db->getPrefix();
+    $tz_offset = intval(date('Z'));
+    
+    // 1. 按IP聚合，计算Bot评分（仅加载独特IP）
+    $ip_query = $db->select(
+        'ip',
+        array('COUNT(*)' => 'cnt'),
+        array('COUNT(DISTINCT cid)' => 'distinct_cids'),
+        array('COUNT(DISTINCT user_agent)' => 'ua_variety'),
+        array('MIN(visit_time)' => 'first_visit'),
+        array('MAX(visit_time)' => 'last_visit'),
+        array('MAX(user_agent)' => 'sample_ua')
+    )->from('table.views_records')
+     ->where('visit_time > ?', $thirty_days_ago)
+     ->group('ip');
+    
+    $ip_aggs = $db->fetchAll($ip_query);
+    $chart_bot_ips = array();
+    $bot_patterns = RecentViewsCounter_Plugin::getBotPatterns();
+    foreach ($ip_aggs as $agg) {
+        $ua_match = false;
+        $ua = strtolower($agg['sample_ua'] ?: '');
+        foreach ($bot_patterns as $p) {
+            if (strpos($ua, strtolower($p)) !== false) { $ua_match = true; break; }
+        }
+        $score = 0;
+        if ($agg['cnt'] > 50) $score += 20;
+        $focus = $agg['cnt'] > 0 ? $agg['distinct_cids'] / $agg['cnt'] : 1;
+        if ($focus < 0.3 && $agg['cnt'] > 10) $score += 15;
+        if ($agg['ua_variety'] == 1 && $agg['cnt'] > 5) $score += 25;
+        $dur = $agg['last_visit'] - $agg['first_visit'];
+        if ($dur > 0 && $agg['cnt'] / ($dur / 3600) > 5) $score += 10;
+        if ($ua_match || $score >= RecentViewsCounter_Plugin::BOT_THRESHOLD) {
+            $chart_bot_ips[] = $agg['ip'];
+        }
+    }
+    
+    // 2. 每日总访问量（SQL聚合）
+    $daily_totals = $db->fetchAll($db->query(
+        "SELECT CAST((visit_time + {$tz_offset}) / 86400 AS INTEGER) AS day_start, COUNT(*) AS cnt
+         FROM {$prefix}views_records
+         WHERE visit_time > {$thirty_days_ago}
+         GROUP BY day_start ORDER BY day_start"
+    ));
+    
+    // 3. 每日Bot访问量（SQL聚合）
+    $bot_map = array();
+    if (!empty($chart_bot_ips)) {
+        $escaped = array();
+        foreach ($chart_bot_ips as $bip) {
+            $escaped[] = "'" . str_replace("'", "''", $bip) . "'";
+        }
+        $daily_bots = $db->fetchAll($db->query(
+            "SELECT CAST((visit_time + {$tz_offset}) / 86400 AS INTEGER) AS day_start, COUNT(*) AS cnt
+              FROM {$prefix}views_records
+              WHERE visit_time > {$thirty_days_ago}
+                AND ip IN (" . implode(',', $escaped) . ")
+              GROUP BY day_start ORDER BY day_start"
+        ));
+        foreach ($daily_bots as $row) {
+            $bot_map[intval($row['day_start'])] = intval($row['cnt']);
+        }
+    }
+    
+    // 合并生成图表数据
+    foreach ($daily_totals as $row) {
+        $ds = intval($row['day_start']);
+        $bot = isset($bot_map[$ds]) ? $bot_map[$ds] : 0;
+        $total = intval($row['cnt']);
         $week_data[] = array(
-            'date' => date('m-d', strtotime($date)),
-            'full_date' => $date,
-            'visits' => $daily_visits,
-            'real_users' => $real_users,
-            'bots' => $bot_count
+            'date' => date('m-d', $ds * 86400 - $tz_offset),
+            'full_date' => date('Y-m-d', $ds * 86400 - $tz_offset),
+            'visits' => $total,
+            'real_users' => $total - $bot,
+            'bots' => $bot
         );
     }
 } catch (Exception $e) {
@@ -628,7 +788,7 @@ try {
 }
 ?>
 
-<div class="main">
+<div class="main" id="tab_content_stats">
     <div class="body container">
         <div class="colgroup">
             <div class="col-mb-12">
@@ -657,18 +817,22 @@ try {
                 </div>
                 
                 <!-- 统计概览 -->
-                <div class="row typecho-page-main" style="margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 10px; max-width: 800px;">
-                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
+                <div class="row typecho-page-main" style="margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 10px; max-width: 900px;">
+                    <div style="flex: 1; min-width: 130px; text-align: center; padding: 15px; background: #f9f9f9;">
                         <h3 style="margin: 0; color: #467b96;"><?php echo $total_visits ? $total_visits['count'] : 0; ?></h3>
-                        <p style="margin: 5px 0 0 0;">总访问量</p>
+                        <p style="margin: 5px 0 0 0;">非蜘蛛访问次数</p>
                     </div>
-                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
-                        <h3 style="margin: 0; color: #dc3545;"><?php echo $total_bots ? $total_bots['count'] : 0; ?></h3>
-                        <p style="margin: 5px 0 0 0;">总蜘蛛数</p>
+                    <div style="flex: 1; min-width: 130px; text-align: center; padding: 15px; background: #f9f9f9;">
+                        <h3 style="margin: 0; color: #dc3545;"><?php echo $total_bots_data ? $total_bots_data['count'] : 0; ?></h3>
+                        <p style="margin: 5px 0 0 0;">总蜘蛛访问次数</p>
                     </div>
-                    <div style="flex: 1; min-width: 150px; text-align: center; padding: 20px; background: #f9f9f9;">
-                        <h3 style="margin: 0; color: #467b96;"><?php echo $unique_visitors ? $unique_visitors['count'] : 0; ?></h3>
-                        <p style="margin: 5px 0 0 0;">独立访客</p>
+                    <div style="flex: 1; min-width: 130px; text-align: center; padding: 15px; background: #f9f9f9;">
+                        <h3 style="margin: 0; color: #467b96;"><?php echo $non_bot_ip_count; ?></h3>
+                        <p style="margin: 5px 0 0 0;">非蜘蛛IP数</p>
+                    </div>
+                    <div style="flex: 1; min-width: 130px; text-align: center; padding: 15px; background: #f9f9f9;">
+                        <h3 style="margin: 0; color: #dc3545;"><?php echo $bot_ip_count; ?></h3>
+                        <p style="margin: 5px 0 0 0;">蜘蛛IP数</p>
                     </div>
                 </div>
 
@@ -882,24 +1046,30 @@ try {
 
                 <!-- IP访问统计 -->
                 <div class="typecho-page-main" style="margin-bottom: 30px;">
-                    <h3>访问最多的IP地址 TOP 20 
+                    <h3>访问最多的IP地址 TOP 20
+                        <select id="ip_view_selector" onchange="switchIpView()" style="font-size: 13px; padding: 2px 8px; margin-left: 10px; vertical-align: middle;">
+                            <option value="all">全部</option>
+                            <option value="nonbot">仅非Bot</option>
+                        </select>
                         <small style="color: #666;" 
                                 title="<?php echo htmlspecialchars($bot_detection_info); ?>">
                              (智能Bot检测)
                          </small>
                     </h3>
-                    <?php if (!empty($top_ips)): ?>
-                    <div class="typecho-table-wrap" style="overflow-x: auto;">
-                        <table class="typecho-list-table" style="min-width: 900px;">
+                    <?php if (!empty($display_top_ips) || !empty($non_bot_top_ips)): ?>
+                    <!-- 全部IP视图 -->
+                    <div id="ip_view_all" class="typecho-table-wrap" style="overflow-x: auto;">
+                        <table class="typecho-list-table" style="min-width: 1000px;">
                             <colgroup>
                                 <col width="5%"/>
-                                <col width="18%"/>
-                                <col width="22%"/>
+                                <col width="16%"/>
+                                <col width="16%"/>
                                 <col width="10%"/>
                                 <col width="8%"/>
-                                <col width="10%"/>
-                                <col width="15%"/>
+                                <col width="9%"/>
+                                <col width="14%"/>
                                 <col width="12%"/>
+                                <col width="10%"/>
                             </colgroup>
                             <thead>
                                 <tr>
@@ -911,23 +1081,23 @@ try {
                                     <th>Bot评分</th>
                                     <th>检测详情</th>
                                     <th>访问详情</th>
+                                    <th>黑名单</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php 
-                                $total_ip_visits = array_sum(array_column($top_ips, 'count'));
+                                $total_ip_visits = array_sum(array_column($display_top_ips, 'count'));
                                 $rank = 1; 
-                                foreach ($top_ips as $ip_data): 
+                                foreach ($display_top_ips as $ip_data): 
                                     $percentage = $total_ip_visits > 0 ? round(($ip_data['count'] / $total_ip_visits) * 100, 1) : 0;
                                 ?>
                                 <tr>
                                     <td><?php echo $rank++; ?></td>
                                     <td>
                                         <?php 
-                                        $ip_color = $ip_data['is_bot'] ? '#ff6b35' : '#333'; // bot使用橙红色，普通用户使用默认颜色
+                                        $ip_color = $ip_data['is_bot'] ? '#ff6b35' : '#333';
                                         $bot_level = '';
-                                        if ($ip_data['bot_score'] >= 60) $bot_level = '高风险Bot';
-                                        elseif ($ip_data['bot_score'] >= 30) $bot_level = '疑似Bot';
+                                        if ($ip_data['is_bot']) $bot_level = 'Bot';
                                         else $bot_level = '正常用户';
                                         $ip_title = 'title="' . $bot_level . ' (评分: ' . $ip_data['bot_score'] . '分)"';
                                         ?>
@@ -954,8 +1124,8 @@ try {
                                     <td>
                                         <?php 
                                         $score_color = '#28a745'; // 绿色 - 正常
-                                        if ($ip_data['bot_score'] >= 60) $score_color = '#dc3545'; // 红色 - 高风险
-                                        elseif ($ip_data['bot_score'] >= 30) $score_color = '#ffc107'; // 黄色 - 疑似
+                                        if ($ip_data['is_bot']) $score_color = '#dc3545'; // 红色 - Bot
+                                        else $score_color = '#28a745'; // 绿色 - 正常
                                         ?>
                                         <span style="color: <?php echo $score_color; ?>; font-weight: bold;" 
                                               title="<?php echo htmlspecialchars($bot_detection_info); ?>">
@@ -972,7 +1142,6 @@ try {
                                         }
                                         if ($ip_data['is_high_frequency']) $detection_details[] = '高频访问';
                                         if ($ip_data['is_focused_crawler']) $detection_details[] = '专注爬取';
-                                        if ($ip_data['empty_ua_ratio'] > 0.5) $detection_details[] = '空UA';
                                         if ($ip_data['ua_variety'] == 1 && $ip_data['count'] > 10) $detection_details[] = '单一UA';
                                         
                                         $visit_duration = $ip_data['last_visit'] - $ip_data['first_visit'];
@@ -992,10 +1161,67 @@ try {
                                             📋 查看详情
                                         </a>
                                     </td>
+                                    <td>
+                                        <?php if ($ip_data['is_blacklisted']): ?>
+                                            <span style="color: #dc3545; font-size: 12px;">☑ 已拉黑</span>
+                                        <?php else: ?>
+                                            <a href="javascript:void(0);" onclick="addToBlacklist('<?php echo htmlspecialchars($ip_data['ip']); ?>', this)"
+                                               style="color: #999; text-decoration: none; font-size: 12px;"
+                                               title="加入黑名单">❌ 拉黑</a>
+                                        <?php endif; ?>
+                                    </td>
                                 </tr>
                                 <?php endforeach; ?>
                             </tbody>
                         </table>
+                    </div>
+                    <!-- 仅非Bot视图 -->
+                    <div id="ip_view_nonbot" class="typecho-table-wrap" style="overflow-x: auto; display: none;">
+                        <?php if (!empty($non_bot_top_ips)): ?>
+                        <table class="typecho-list-table" style="min-width: 1000px;">
+                            <colgroup>
+                                <col width="5%"/>
+                                <col width="16%"/>
+                                <col width="16%"/>
+                                <col width="10%"/>
+                                <col width="8%"/>
+                                <col width="9%"/>
+                                <col width="14%"/>
+                                <col width="12%"/>
+                                <col width="10%"/>
+                            </colgroup>
+                            <thead><tr>
+                                <th>排名</th><th>IP地址</th><th>归属地</th>
+                                <th>访问次数</th><th>占比</th>
+                                <th>Bot评分</th><th>检测详情</th><th>访问详情</th><th>黑名单</th>
+                            </tr></thead>
+                            <tbody>
+                                <?php $rank = 1; $total_nb = array_sum(array_column($non_bot_top_ips, 'count')); foreach ($non_bot_top_ips as $ip_data): ?>
+                                <tr>
+                                    <td><?php echo $rank++; ?></td>
+                                    <td><strong style="font-family: monospace; color: #467b96;"><?php echo htmlspecialchars($ip_data['ip']); ?></strong></td>
+                                    <td><?php echo htmlspecialchars($ip_data['location'] ?: '未知地区'); ?></td>
+                                    <td><span style="color: #28a745; font-weight: bold;"><?php echo number_format($ip_data['count']); ?></span></td>
+                                    <td><span style="color: #6c757d;"><?php echo $total_nb > 0 ? round(($ip_data['count'] / $total_nb) * 100, 1) : 0; ?>%</span></td>
+                                    <td><span style="color: #28a745; font-weight: bold;"><?php echo $ip_data['bot_score']; ?>分</span></td>
+                                    <td><span style="color: #28a745;">正常</span></td>
+                                    <td><a href="javascript:void(0);" onclick="showIpVisitDetails('<?php echo htmlspecialchars($ip_data['ip']); ?>')" style="color: #0073aa; font-size: 12px;">📋 查看详情</a></td>
+                                    <td>
+                                        <?php if ($ip_data['is_blacklisted']): ?>
+                                            <span style="color: #dc3545; font-size: 12px;">☑ 已拉黑</span>
+                                        <?php else: ?>
+                                            <a href="javascript:void(0);" onclick="addToBlacklist('<?php echo htmlspecialchars($ip_data['ip']); ?>', this)"
+                                               style="color: #999; text-decoration: none; font-size: 12px;"
+                                               title="加入黑名单">❌ 拉黑</a>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                        <?php else: ?>
+                        <div class="typecho-page-main"><div class="message notice"><p>当前时间范围内无非Bot IP数据</p></div></div>
+                        <?php endif; ?>
                     </div>
                     <?php else: ?>
                     <div class="typecho-page-main">
@@ -1005,6 +1231,13 @@ try {
                     </div>
                     <?php endif; ?>
                     
+                    <!-- 黑名单管理入口 -->
+                    <div style="background: #fff8f0; padding: 12px 15px; border: 1px solid #ffe0b2; border-radius: 4px; margin-top: 15px;">
+                        <span style="color: #e65100; font-size: 13px;">🛡️ <strong>IP黑名单：</strong>可手动将恶意IP加入黑名单，加入后该IP将无法访问网站。
+                        <a href="#" onclick="switchTab('blacklist'); return false;"
+                           style="color: #0073aa; text-decoration: none; margin-left: 8px;">管理黑名单 →</a></span>
+                    </div>
+
                     <!-- Bot检测说明 -->
                     <div id="botDetectionInfo" style="background: #f8f9fa; padding: 15px; border: 1px solid #dee2e6; border-radius: 4px; margin-top: 15px; display: none;">
                         <h4 style="margin: 0 0 10px 0; color: #495057;">🤖 智能Bot检测说明</h4>
@@ -1013,16 +1246,17 @@ try {
                             <p style="margin: 5px 0;"><strong>评分规则：</strong></p>
                             <ul style="margin: 5px 0; padding-left: 20px;">
                                 <li><strong>UA识别</strong> (40分): 检测到已知爬虫User-Agent</li>
-                                <li><strong>高频访问</strong> (20分): 访问次数超过100次</li>
-                                <li><strong>专注爬取</strong> (15分): 访问内容集中度高 (访问文章种类/总访问 < 0.1)</li>
-                                <li><strong>空UA</strong> (10分): 超过50%的请求User-Agent为空</li>
-                                <li><strong>单一UA</strong> (10分): 只使用一种User-Agent且访问超过10次</li>
-                                <li><strong>高频率</strong> (5分): 每小时访问超过10次</li>
+                                <li><strong>高频访问</strong> (20分): 访问次数超过50次</li>
+                                <li><strong>专注爬取</strong> (15分): 访问内容集中度高 (访问文章种类/总访问 < 0.3)</li>
+                                <li><strong>单一UA</strong> (25分): 只使用一种User-Agent且访问超过5次</li>
+                                <li><strong>高频率</strong> (10分): 每小时访问超过5次</li>
                             </ul>
-                            <p style="margin: 5px 0;"><strong>风险等级：</strong>
-                                <span style="color: #28a745;">0-29分 正常用户</span> | 
-                                <span style="color: #ffc107;">30-59分 疑似Bot</span> | 
-                                <span style="color: #dc3545;">60+分 高风险Bot</span>
+                            <p style="margin: 5px 0;"><strong>判定规则：</strong>
+                                <span style="color: #467b96;">UA匹配 → Bot</span> 或
+                                <span style="color: #dc3545;">行为评分 ≥<?php echo RecentViewsCounter_Plugin::BOT_THRESHOLD; ?>分 → Bot</span>
+                            </p>
+                            <p style="margin: 5px 0; font-size: 12px; color: #999;">
+                                (IP TOP 20表显示纯行为评分，不含UA识别分)
                             </p>
                         </div>
                     </div>
@@ -1056,8 +1290,6 @@ try {
                                     <td><?php echo $rank++; ?></td>
                                     <td>
                                         <?php 
-                                        // 获取文章完整信息以生成正确的链接
-                        $db = Typecho_Db::get();
                         try {
                             $full_article = $db->fetchRow($db->select('*')->from('table.contents')->where('cid = ?', $article['cid']));
                         } catch (Exception $e) {
@@ -1196,1036 +1428,97 @@ try {
     </div>
 </div>
 
+<!-- 黑名单管理 -->
+<div id="tab_content_blacklist" style="display:none;">
+    <div class="main">
+        <div class="body container">
+            <div class="colgroup">
+                <div class="col-mb-12">
+                    <div style="margin-bottom: 15px;">
+                        <a href="#" onclick="switchTab('stats'); return false;" style="color: #467b96; text-decoration: none;">← 返回访问统计</a>
+                    </div>
+                    <!-- 添加 IP 到黑名单 -->
+                    <div class="typecho-page-main" style="margin-bottom: 20px;">
+                        <div style="background: #fff; padding: 20px; border: 1px solid #e9e9e6; border-radius: 4px;">
+                            <h3 style="margin-top: 0;">添加 IP 到黑名单</h3>
+                            <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px;">
+                                <input type="text" id="blacklist_ip" placeholder="输入IP地址，如 192.168.1.1"
+                                       style="flex: 1; min-width: 200px; height: 36px; padding: 4px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
+                                <input type="text" id="blacklist_reason" placeholder="拉黑理由（可选）"
+                                       style="flex: 1; min-width: 150px; height: 36px; padding: 4px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box;">
+                                <button onclick="addToBlacklistFromInput()" class="btn btn-s" style="height: 36px; white-space: nowrap;">加入黑名单</button>
+                            </div>
+                            <div id="add_result" style="margin-top: 10px; font-size: 13px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- 黑名单列表 -->
+                    <div class="typecho-page-main" style="margin-bottom: 30px;">
+                        <h3>黑名单列表 <span id="blacklist_count" style="font-size: 14px; color: #666; font-weight: normal;">(共 <?php echo $blacklist_total; ?> 条)</span></h3>
+                        <div id="blacklist_table_wrap" class="typecho-table-wrap" style="overflow-x: auto;">
+                            <?php if (!empty($blacklist_result['data'])): ?>
+                            <table class="typecho-list-table" style="min-width: 700px;">
+                                <colgroup>
+                                    <col width="25%"/>
+                                    <col width="35%"/>
+                                    <col width="25%"/>
+                                    <col width="15%"/>
+                                </colgroup>
+                                <thead>
+                                    <tr>
+                                        <th>IP地址</th>
+                                        <th>拉黑理由</th>
+                                        <th>拉黑时间</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="blacklist_tbody">
+                                    <?php foreach ($blacklist_result['data'] as $item): ?>
+                                    <tr id="bl_<?php echo htmlspecialchars($item['ip']); ?>">
+                                        <td><strong style="font-family: monospace;"><?php echo htmlspecialchars($item['ip']); ?></strong></td>
+                                        <td><?php echo htmlspecialchars($item['reason'] ?: '-'); ?></td>
+                                        <td><?php echo date('Y-m-d H:i:s', $item['created_time']); ?></td>
+                                        <td>
+                                            <button onclick="removeFromBlacklist('<?php echo htmlspecialchars($item['ip']); ?>')"
+                                                    style="background: #dc3545; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;">解封</button>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                            <div id="blacklist_pagination" style="margin-top: 15px; text-align: center;">
+                                <?php
+                                $bl_perPage = 20;
+                                $bl_totalPages = ceil($blacklist_total / $bl_perPage);
+                                if ($bl_totalPages > 1):
+                                    for ($i = 1; $i <= $bl_totalPages; $i++):
+                                ?>
+                                    <button onclick="loadBlacklistPage(<?php echo $i; ?>)"
+                                            class="btn btn-s" style="margin: 0 2px; <?php echo $i === 1 ? 'background: #0073aa; color: white;' : ''; ?>">
+                                        <?php echo $i; ?>
+                                    </button>
+                                <?php
+                                    endfor;
+                                endif;
+                                ?>
+                            </div>
+                            <?php endif; ?>
+                        </div>
+                        <div id="blacklist_empty" style="<?php echo empty($blacklist_result['data']) ? '' : 'display: none;'; ?>">
+                            <div class="message notice"><p>黑名单为空</p></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 
 
 <script>
-// 绘制访问趋势图
-function drawChart() {
-    var canvas = document.getElementById('visitChart');
-    if (!canvas) return;
-
-    var ctx = canvas.getContext('2d');
-    var data = <?php echo json_encode($week_data); ?>;
-
-    // 获取设备像素比,解决高DPI屏幕模糊问题
-    var dpr = window.devicePixelRatio || 1;
-
-    // 获取容器实际宽度
-    var container = canvas.parentElement;
-    var displayWidth = container.offsetWidth;
-    var displayHeight = 300;
-
-    // 根据宽度自适应调整padding和字体
-    var padding = displayWidth < 500 ? 30 : 40;
-    var fontSize = displayWidth < 500 ? 10 : 12;
-    var labelFontSize = displayWidth < 500 ? 10 : 12;
-
-    // 设置canvas实际尺寸(考虑DPI)
-    canvas.width = displayWidth * dpr;
-    canvas.height = displayHeight * dpr;
-
-    // 设置canvas显示尺寸
-    canvas.style.width = displayWidth + 'px';
-    canvas.style.height = displayHeight + 'px';
-
-    // 缩放绘图上下文以匹配DPI
-    ctx.scale(dpr, dpr);
-
-    var width = displayWidth;
-    var height = displayHeight;
-    var chartWidth = width - 2 * padding;
-    var chartHeight = height - 2 * padding;
-    
-    // 清空画布
-    ctx.clearRect(0, 0, width, height);
-    
-    if (!data || data.length === 0) {
-        ctx.fillStyle = '#999';
-        ctx.font = '16px Arial';
-        ctx.textAlign = 'center';
-        ctx.fillText('暂无访问趋势数据', width / 2, height / 2);
-        return;
-    }
-    
-    // 找出最大值
-    var maxRealUsers = Math.max.apply(Math, data.map(function(item) { return item.real_users || 0; }));
-    var maxBots = Math.max.apply(Math, data.map(function(item) { return item.bots || 0; }));
-    var maxValue = Math.max(maxRealUsers, maxBots);
-    if (maxValue === 0) maxValue = 1;
-    
-    // 绘制坐标轴
-    ctx.strokeStyle = '#ccc';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(padding, padding);
-    ctx.lineTo(padding, height - padding);
-    ctx.lineTo(width - padding, height - padding);
-    ctx.stroke();
-    
-    // 绘制网格线
-    ctx.strokeStyle = '#f0f0f0';
-    ctx.lineWidth = 0.5;
-    for (var i = 1; i <= 5; i++) {
-        var y = padding + (i * chartHeight / 5);
-        ctx.beginPath();
-        ctx.moveTo(padding, y);
-        ctx.lineTo(width - padding, y);
-        ctx.stroke();
-    }
-    
-    // 绘制非蜘蛛数折线图（真实用户访问量）
-    ctx.strokeStyle = '#467b96';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / (data.length - 1));
-        var y = height - padding - ((data[i].real_users || 0) / maxValue * chartHeight);
-        
-        if (i === 0) {
-            ctx.moveTo(x, y);
-        } else {
-            ctx.lineTo(x, y);
-        }
-    }
-    ctx.stroke();
-    
-    // 绘制蜘蛛数折线图
-    ctx.strokeStyle = '#ff6b35';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / (data.length - 1));
-        var y = height - padding - ((data[i].bots || 0) / maxValue * chartHeight);
-        
-        if (i === 0) {
-            ctx.moveTo(x, y);
-        } else {
-            ctx.lineTo(x, y);
-        }
-    }
-    ctx.stroke();
-    
-    // 绘制数据点和标签
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / (data.length - 1));
-        var y = height - padding - ((data[i].real_users || 0) / maxValue * chartHeight);
-        
-        // 判断是否为周末
-        var isWeekend = false;
-        if (data[i].full_date) {
-            var date = new Date(data[i].full_date);
-            var dayOfWeek = date.getDay();
-            isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
-        }
-        
-        // 绘制非蜘蛛数据点 - 周末标红，工作日用蓝色
-        ctx.fillStyle = isWeekend ? '#ff0000' : '#467b96';
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, 2 * Math.PI);
-        ctx.fill();
-        
-        // 绘制日期标签 - 周末标红，工作日用灰色
-        ctx.fillStyle = isWeekend ? '#ff0000' : '#666';
-        ctx.font = fontSize + 'px Arial';
-        ctx.textAlign = 'center';
-        ctx.fillText(data[i].date.split('-')[1], x, height - padding + 15);
-
-        // 绘制非蜘蛛数值标签 - 周末标红，工作日用蓝色
-        ctx.fillStyle = isWeekend ? '#ff0000' : '#467b96';
-        ctx.fillText(data[i].real_users || 0, x, y - 10);
-        
-        // 绘制蜘蛛数据点
-        var botY = height - padding - ((data[i].bots || 0) / maxValue * chartHeight);
-        ctx.fillStyle = '#ff6b35';
-        ctx.beginPath();
-        ctx.arc(x, botY, 3, 0, 2 * Math.PI);
-        ctx.fill();
-        
-        // 绘制蜘蛛数值标签
-        ctx.fillStyle = '#ff6b35';
-        ctx.fillText(data[i].bots || 0, x, botY - 10);
-    }
-    
-    // 绘制图例
-    var legendY = padding - 20;
-
-    // 非蜘蛛数图例
-    ctx.fillStyle = '#467b96';
-    ctx.font = labelFontSize + 'px Arial';
-    ctx.textAlign = 'left';
-    ctx.fillText('● 非蜘蛛数', padding, legendY + 4);
-
-    // 蜘蛛数图例
-    ctx.fillStyle = '#ff6b35';
-    ctx.fillText('● 蜘蛛数', padding + 80, legendY + 4);
-
-    // 工作日图例
-    ctx.fillStyle = '#666';
-    ctx.fillText('工作日', padding + 160, legendY + 4);
-
-    // 周末图例
-    ctx.fillStyle = '#ff0000';
-    ctx.fillText('周末', padding + 210, legendY + 4);
-}
-
-// 绘制月度访问统计图
-function drawMonthlyChart() {
-    var canvas = document.getElementById('monthlyChart');
-    if (!canvas) return;
-
-    var ctx = canvas.getContext('2d');
-    var data = <?php echo json_encode($monthly_stats); ?>;
-
-    // 获取设备像素比,解决高DPI屏幕模糊问题
-    var dpr = window.devicePixelRatio || 1;
-
-    // 获取容器实际宽度
-    var container = canvas.parentElement;
-    var displayWidth = container.offsetWidth;
-    var displayHeight = 300;
-
-    // 根据宽度自适应调整padding和字体
-    var padding = displayWidth < 500 ? 35 : 50;
-    var fontSize = displayWidth < 500 ? 10 : 11;
-    var labelFontSize = displayWidth < 500 ? 10 : 12;
-
-    // 设置canvas实际尺寸(考虑DPI)
-    canvas.width = displayWidth * dpr;
-    canvas.height = displayHeight * dpr;
-
-    // 设置canvas显示尺寸
-    canvas.style.width = displayWidth + 'px';
-    canvas.style.height = displayHeight + 'px';
-
-    // 缩放绘图上下文以匹配DPI
-    ctx.scale(dpr, dpr);
-
-    var width = displayWidth;
-    var height = displayHeight;
-    var chartWidth = width - 2 * padding;
-    var chartHeight = height - 2 * padding;
-    
-    // 清空画布
-    ctx.clearRect(0, 0, width, height);
-    
-    if (!data || data.length === 0) {
-        // 显示无数据提示
-        ctx.fillStyle = '#999';
-        ctx.font = '16px Arial';
-        ctx.textAlign = 'center';
-        ctx.fillText('暂无月度统计数据', width / 2, height / 2);
-        return;
-    }
-    
-    // 找出最大值
-    var maxValue = Math.max.apply(Math, data.map(function(item) { return parseInt(item.total_visits); }));
-    if (maxValue === 0) maxValue = 1;
-    
-    // 绘制坐标轴
-    ctx.strokeStyle = '#ddd';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(padding, padding);
-    ctx.lineTo(padding, height - padding);
-    ctx.lineTo(width - padding, height - padding);
-    ctx.stroke();
-    
-    // 绘制网格线
-    ctx.strokeStyle = '#f0f0f0';
-    ctx.lineWidth = 0.5;
-    for (var i = 1; i <= 5; i++) {
-        var y = padding + (i * chartHeight / 5);
-        ctx.beginPath();
-        ctx.moveTo(padding, y);
-        ctx.lineTo(width - padding, y);
-        ctx.stroke();
-        
-        // 绘制Y轴标签
-        ctx.fillStyle = '#666';
-        ctx.font = fontSize + 'px Arial';
-        ctx.textAlign = 'right';
-        var value = Math.round(maxValue * (5 - i) / 5);
-        ctx.fillText(value.toString(), padding - 10, y + 4);
-    }
-    
-    // 绘制总访问量折线
-    ctx.strokeStyle = '#28a745';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / Math.max(data.length - 1, 1));
-        var visits = parseInt(data[i].total_visits);
-        var y = height - padding - (visits / maxValue * chartHeight);
-        
-        if (i === 0) {
-            ctx.moveTo(x, y);
-        } else {
-            ctx.lineTo(x, y);
-        }
-    }
-    
-    ctx.stroke();
-    
-    // 绘制总访问量数据点和标签
-    ctx.fillStyle = '#28a745';
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / Math.max(data.length - 1, 1));
-        var visits = parseInt(data[i].total_visits);
-        var y = height - padding - (visits / maxValue * chartHeight);
-        
-        // 绘制数据点
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, 2 * Math.PI);
-        ctx.fill();
-        
-        // 绘制月份标签
-        ctx.fillStyle = '#666';
-        ctx.font = fontSize + 'px Arial';
-        ctx.textAlign = 'center';
-        var monthLabel = data[i].year_month.split('-')[1];
-        ctx.fillText(monthLabel, x, height - padding + 15);
-
-        // 绘制数值标签
-        ctx.fillStyle = '#28a745';
-        ctx.font = 'bold ' + fontSize + 'px Arial';
-        ctx.fillText(visits.toString(), x, y - 10);
-        ctx.fillStyle = '#28a745';
-    }
-    
-    // 绘制独立访客折线
-    ctx.strokeStyle = '#17a2b8';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 5]); // 虚线
-    ctx.beginPath();
-    
-    var maxUniqueVisitors = Math.max.apply(Math, data.map(function(item) { return parseInt(item.unique_visitors); }));
-    if (maxUniqueVisitors === 0) maxUniqueVisitors = 1;
-    
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / Math.max(data.length - 1, 1));
-        var uniqueVisitors = parseInt(data[i].unique_visitors);
-        var y = height - padding - (uniqueVisitors / maxValue * chartHeight); // 使用相同的比例尺
-        
-        if (i === 0) {
-            ctx.moveTo(x, y);
-        } else {
-            ctx.lineTo(x, y);
-        }
-    }
-    
-    ctx.stroke();
-    ctx.setLineDash([]); // 重置线条样式
-    
-    // 绘制独立访客数据点
-    ctx.fillStyle = '#17a2b8';
-    for (var i = 0; i < data.length; i++) {
-        var x = padding + (i * chartWidth / Math.max(data.length - 1, 1));
-        var uniqueVisitors = parseInt(data[i].unique_visitors);
-        var y = height - padding - (uniqueVisitors / maxValue * chartHeight);
-        
-        // 绘制数据点
-        ctx.beginPath();
-        ctx.arc(x, y, 3, 0, 2 * Math.PI);
-        ctx.fill();
-    }
-    
-    // 绘制图例
-    var legendY = padding - 20;
-    ctx.fillStyle = '#28a745';
-    ctx.fillRect(padding, legendY, 15, 3);
-    ctx.fillStyle = '#333';
-    ctx.font = labelFontSize + 'px Arial';
-    ctx.textAlign = 'left';
-    ctx.fillText('总访问量', padding + 20, legendY + 10);
-
-    ctx.strokeStyle = '#17a2b8';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 5]);
-    ctx.beginPath();
-    ctx.moveTo(padding + 120, legendY + 1.5);
-    ctx.lineTo(padding + 135, legendY + 1.5);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = '#333';
-    ctx.fillText('独立访客', padding + 140, legendY + 10);
-}
-
-// 页面加载完成后绘制图表
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-        drawChart();
-        drawMonthlyChart();
-    });
-} else {
-    drawChart();
-    drawMonthlyChart();
-}
-
-// 窗口大小变化时重绘图表
-var resizeTimer;
-window.addEventListener('resize', function() {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function() {
-        drawChart();
-        drawMonthlyChart();
-    }, 250);
-});
-
-// 显示访问记录模态框
-function showVisitRecords(cid, title) {
-    // 创建模态框
-    var modal = document.createElement('div');
-    modal.id = 'visitRecordsModal';
-    modal.style.cssText = `
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: rgba(0,0,0,0.5);
-        z-index: 10000;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    `;
-    
-    var modalContent = document.createElement('div');
-    modalContent.style.cssText = `
-        background: white;
-        padding: 20px;
-        border-radius: 8px;
-        max-width: 80%;
-        max-height: 80%;
-        overflow: auto;
-        position: relative;
-    `;
-    
-    modalContent.innerHTML = `
-        <h3 style="margin-top: 0; color: #467b96;">文章访问记录</h3>
-        <p><strong>文章标题：</strong>${title}</p>
-        <div id="recordsContent">正在加载访问记录...</div>
-        <button onclick="closeVisitRecords()" style="
-            position: absolute;
-            top: 10px;
-            right: 15px;
-            background: none;
-            border: none;
-            font-size: 20px;
-            cursor: pointer;
-            color: #999;
-        ">×</button>
-        <div style="text-align: center; margin-top: 20px;">
-            <button onclick="closeVisitRecords()" class="btn btn-s">关闭</button>
-        </div>
-    `;
-    
-    modal.appendChild(modalContent);
-    document.body.appendChild(modal);
-    
-    // 加载访问记录数据
-    loadVisitRecords(cid);
-}
-
-// 关闭访问记录模态框
-function closeVisitRecords() {
-    var modal = document.getElementById('visitRecordsModal');
-    if (modal) {
-        modal.remove();
-    }
-}
-
-// 加载访问记录数据
-function loadVisitRecords(cid) {
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', window.location.href, true);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-    
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4) {
-            var recordsContent = document.getElementById('recordsContent');
-            if (xhr.status === 200) {
-                try {
-                    var response = JSON.parse(xhr.responseText);
-                    if (response.success) {
-                        displayVisitRecords(response.data);
-                    } else {
-                        recordsContent.innerHTML = '<p style="color: #dc3545;">加载失败：' + (response.message || '未知错误') + '</p>';
-                    }
-                } catch (e) {
-                    console.error('JSON解析错误:', e);
-                    console.error('响应内容:', xhr.responseText);
-                    recordsContent.innerHTML = '<p style="color: #dc3545;">数据解析失败</p><details><summary>详细信息</summary><pre>' + xhr.responseText + '</pre></details>';
-                }
-            } else {
-                recordsContent.innerHTML = '<p style="color: #dc3545;">网络请求失败</p>';
-            }
-        }
-    };
-    
-    xhr.send('action=get_visit_records&cid=' + cid);
-}
-
-// 显示访问记录数据
-function displayVisitRecords(records) {
-    var recordsContent = document.getElementById('recordsContent');
-    
-    if (!records || records.length === 0) {
-        recordsContent.innerHTML = '<p>暂无访问记录</p>';
-        return;
-    }
-    
-    var html = `
-        <div style="max-height: 400px; overflow-y: auto;">
-            <table class="typecho-list-table" style="margin: 0;">
-                <thead>
-                    <tr>
-                        <th style="width: 20%;">访问时间</th>
-                        <th style="width: 25%;">IP地址</th>
-                        <th style="width: 35%;">User Agent</th>
-                        <th style="width: 20%;">归属地</th>
-                    </tr>
-                </thead>
-                <tbody>
-    `;
-    
-    records.forEach(function(record) {
-        var visitTime = new Date(record.visit_time * 1000).toLocaleString('zh-CN');
-        var userAgent = record.user_agent || '未知';
-        var location = record.location || '未知地区';
-        
-        // 截断过长的User Agent
-        if (userAgent.length > 50) {
-            userAgent = userAgent.substring(0, 50) + '...';
-        }
-        
-        // 截断过长的地区信息
-        if (location.length > 30) {
-            location = location.substring(0, 30) + '...';
-        }
-        
-        html += `
-            <tr>
-                <td>${visitTime}</td>
-                <td>${record.ip}</td>
-                <td title="${record.user_agent || ''}">${userAgent}</td>
-                <td title="${record.location || ''}">${location}</td>
-            </tr>
-        `;
-    });
-    
-    html += `
-                </tbody>
-            </table>
-        </div>
-        <p style="margin-top: 15px; color: #666; font-size: 12px;">显示最近100条访问记录</p>
-    `;
-    
-    recordsContent.innerHTML = html;
-}
-
-// IP访问详情相关函数
-function showIpVisitDetails(ip) {
-    // 创建模态框
-    if (!document.getElementById('ipVisitDetailsModal')) {
-        const modal = document.createElement('div');
-        modal.id = 'ipVisitDetailsModal';
-        modal.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 10000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        `;
-        
-        modal.innerHTML = `
-            <div style="
-                background: white;
-                border-radius: 8px;
-                width: 90%;
-                max-width: 1000px;
-                max-height: 80%;
-                overflow: hidden;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            ">
-                <div style="
-                    padding: 20px;
-                    border-bottom: 1px solid #eee;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    background: #f8f9fa;
-                ">
-                    <h3 style="margin: 0; color: #333;">IP访问详情</h3>
-                    <button onclick="closeIpVisitDetails()" style="
-                        background: none;
-                        border: none;
-                        font-size: 24px;
-                        cursor: pointer;
-                        color: #666;
-                        padding: 0;
-                        width: 30px;
-                        height: 30px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                    ">×</button>
-                </div>
-                <div id="ipVisitDetailsContent" style="
-                    padding: 20px;
-                    max-height: 500px;
-                    overflow-y: auto;
-                ">加载中...</div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-    }
-    
-    document.getElementById('ipVisitDetailsModal').style.display = 'flex';
-    loadIpVisitDetails(ip);
-}
-
-function closeIpVisitDetails() {
-    const modal = document.getElementById('ipVisitDetailsModal');
-    if (modal) {
-        modal.style.display = 'none';
-    }
-}
-
-function loadIpVisitDetails(ip) {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', window.location.href, true);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-    
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4) {
-            if (xhr.status === 200) {
-                try {
-                    const response = JSON.parse(xhr.responseText);
-                    if (response.success) {
-                        displayIpVisitDetails(response.data, ip);
-                    } else {
-                        document.getElementById('ipVisitDetailsContent').innerHTML = 
-                            '<div style="color: #dc3545; text-align: center; padding: 20px;">❌ ' + 
-                            (response.message || '获取数据失败') + '</div>';
-                    }
-                } catch (e) {
-                    console.error('JSON解析错误:', e);
-                    console.log('原始响应:', xhr.responseText);
-                    document.getElementById('ipVisitDetailsContent').innerHTML = 
-                        '<div style="color: #dc3545; text-align: center; padding: 20px;">' +
-                        '❌ 数据解析失败<br>' +
-                        '<details style="margin-top: 10px; text-align: left;">' +
-                        '<summary style="cursor: pointer;">查看详细错误信息</summary>' +
-                        '<pre style="background: #f8f9fa; padding: 10px; margin-top: 5px; font-size: 12px; overflow: auto;">' +
-                        '解析错误: ' + e.message + '\n\n' +
-                        '原始响应: ' + xhr.responseText.substring(0, 500) + 
-                        (xhr.responseText.length > 500 ? '...' : '') +
-                        '</pre></details></div>';
-                }
-            } else {
-                document.getElementById('ipVisitDetailsContent').innerHTML = 
-                    '<div style="color: #dc3545; text-align: center; padding: 20px;">❌ 请求失败，状态码: ' + xhr.status + '</div>';
-            }
-        }
-    };
-    
-    xhr.send('action=get_ip_visit_details&ip=' + encodeURIComponent(ip));
-}
-
-function displayIpVisitDetails(records, ip) {
-    if (!records || records.length === 0) {
-        document.getElementById('ipVisitDetailsContent').innerHTML = 
-            '<div style="text-align: center; padding: 20px; color: #666;">📭 该IP暂无访问记录</div>';
-        return;
-    }
-    
-    let html = `
-        <div style="margin-bottom: 15px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
-            <h4 style="margin: 0 0 10px 0; color: #495057;">🌐 IP地址: ${ip}</h4>
-            <p style="margin: 0; color: #6c757d; font-size: 14px;">共找到 ${records.length} 条访问记录</p>
-        </div>
-        <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                <thead>
-                    <tr style="background: #f8f9fa;">
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">访问时间</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">访问文章</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">User Agent</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">归属地</th>
-                    </tr>
-                </thead>
-                <tbody>
-    `;
-    
-    records.forEach(record => {
-        const visitTime = new Date(record.visit_time * 1000).toLocaleString('zh-CN');
-        
-        // 截断过长的User Agent
-        let userAgent = record.user_agent || '未知';
-        if (userAgent.length > 50) {
-            userAgent = userAgent.substring(0, 50) + '...';
-        }
-        
-        // 截断过长的地区信息
-        let location = record.location || '未知';
-        if (location.length > 30) {
-            location = location.substring(0, 30) + '...';
-        }
-        
-        // 获取文章标题
-        let articleTitle = record.article_title || '未知文章';
-        if (articleTitle.length > 40) {
-            articleTitle = articleTitle.substring(0, 40) + '...';
-        }
-        
-        html += `
-            <tr>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${visitTime}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;" title="${record.article_title || ''}">${articleTitle}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;" title="${record.user_agent || ''}">${userAgent}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;" title="${record.location || ''}">${location}</td>
-            </tr>
-        `;
-    });
-    
-    html += `
-                </tbody>
-            </table>
-        </div>
-    `;
-    
-    document.getElementById('ipVisitDetailsContent').innerHTML = html;
-}
-
-// IP归属地数据管理相关函数
-function loadIpLocationData(page = 1) {
-    // 创建模态框
-    if (!document.getElementById('ipLocationModal')) {
-        const modal = document.createElement('div');
-        modal.id = 'ipLocationModal';
-        modal.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 10000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        `;
-        
-        modal.innerHTML = `
-            <div style="
-                background: white;
-                border-radius: 8px;
-                width: 90%;
-                max-width: 1000px;
-                max-height: 80%;
-                overflow: hidden;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            ">
-                <div style="
-                    padding: 20px;
-                    border-bottom: 1px solid #dee2e6;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    background: #f8f9fa;
-                ">
-                    <h3 style="margin: 0; color: #333;">IP归属地数据管理</h3>
-                    <button onclick="closeIpLocationModal()" style="
-                        background: none;
-                        border: none;
-                        font-size: 24px;
-                        cursor: pointer;
-                        color: #666;
-                        padding: 0;
-                        width: 30px;
-                        height: 30px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                    ">×</button>
-                </div>
-                <div id="ipLocationContent" style="
-                    padding: 20px;
-                    max-height: 500px;
-                    overflow-y: auto;
-                ">加载中...</div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-    }
-    
-    document.getElementById('ipLocationModal').style.display = 'flex';
-    
-    // 发送AJAX请求获取IP数据
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', window.location.href, true);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-    
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4) {
-            if (xhr.status === 200) {
-                try {
-                    const response = JSON.parse(xhr.responseText);
-                    if (response.success) {
-                        displayIpLocationData(response.data, response.total, page);
-                    } else {
-                        document.getElementById('ipLocationContent').innerHTML = 
-                            '<div style="color: #dc3545; text-align: center; padding: 20px;">❌ ' + 
-                            (response.message || '获取数据失败') + '</div>';
-                    }
-                } catch (e) {
-                    console.error('JSON解析错误:', e);
-                    document.getElementById('ipLocationContent').innerHTML = 
-                        '<div style="color: #dc3545; text-align: center; padding: 20px;">❌ 数据解析失败</div>';
-                }
-            } else {
-                document.getElementById('ipLocationContent').innerHTML = 
-                    '<div style="color: #dc3545; text-align: center; padding: 20px;">❌ 请求失败，状态码: ' + xhr.status + '</div>';
-            }
-        }
-    };
-    
-    xhr.send('action=get_ip_location_data&page=' + page);
-}
-
-function closeIpLocationModal() {
-    const modal = document.getElementById('ipLocationModal');
-    if (modal) {
-        modal.style.display = 'none';
-    }
-}
-
-function displayIpLocationData(data, total, currentPage) {
-    if (!data || data.length === 0) {
-        document.getElementById('ipLocationContent').innerHTML = 
-            '<div style="text-align: center; padding: 20px; color: #666;">📭 暂无IP归属地数据</div>';
-        return;
-    }
-    
-    const perPage = 20;
-    const totalPages = Math.ceil(total / perPage);
-    
-    let html = `
-        <div style="margin-bottom: 15px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
-            <h4 style="margin: 0 0 10px 0; color: #495057;">🌐 IP归属地数据库</h4>
-            <p style="margin: 0; color: #6c757d; font-size: 14px;">共 ${total} 条记录，当前第 ${currentPage}/${totalPages} 页</p>
-        </div>
-        <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                <thead>
-                    <tr style="background: #f8f9fa;">
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">IP地址</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">归属地</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">国家</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">省份</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">城市</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">运营商</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">更新时间</th>
-                        <th style="padding: 10px; border: 1px solid #dee2e6; text-align: left;">操作</th>
-                    </tr>
-                </thead>
-                <tbody>
-    `;
-    
-    data.forEach(record => {
-        const updateTime = new Date(record.updated_time * 1000).toLocaleString('zh-CN');
-        
-        html += `
-            <tr>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.ip}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.location || '未知'}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.country || '未知'}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.region || '未知'}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.city || '未知'}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${record.isp || '未知'}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">${updateTime}</td>
-                <td style="padding: 8px; border: 1px solid #dee2e6;">
-                    <button onclick="deleteIpLocation('${record.ip}')" 
-                            style="background: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 12px;"
-                            title="删除此IP记录">删除</button>
-                </td>
-            </tr>
-        `;
-    });
-    
-    html += `
-                </tbody>
-            </table>
-        </div>
-    `;
-    
-    // 添加分页
-    if (totalPages > 1) {
-        html += '<div style="margin-top: 20px; text-align: center;">';
-        
-        if (currentPage > 1) {
-            html += `<button onclick="loadIpLocationData(${currentPage - 1})" style="margin: 0 5px; padding: 5px 10px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer;">上一页</button>`;
-        }
-        
-        for (let i = Math.max(1, currentPage - 2); i <= Math.min(totalPages, currentPage + 2); i++) {
-            if (i === currentPage) {
-                html += `<button style="margin: 0 2px; padding: 5px 10px; background: #0073aa; color: white; border: none; border-radius: 3px;">${i}</button>`;
-            } else {
-                html += `<button onclick="loadIpLocationData(${i})" style="margin: 0 2px; padding: 5px 10px; background: #f1f1f1; color: #333; border: none; border-radius: 3px; cursor: pointer;">${i}</button>`;
-            }
-        }
-        
-        if (currentPage < totalPages) {
-            html += `<button onclick="loadIpLocationData(${currentPage + 1})" style="margin: 0 5px; padding: 5px 10px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer;">下一页</button>`;
-        }
-        
-        html += '</div>';
-    }
-    
-    document.getElementById('ipLocationContent').innerHTML = html;
-}
-
-function deleteIpLocation(ip) {
-    if (!confirm('确定要删除IP "' + ip + '" 的归属地记录吗？此操作不可恢复！')) {
-        return;
-    }
-    
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', window.location.href, true);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-    
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4) {
-            if (xhr.status === 200) {
-                try {
-                    const response = JSON.parse(xhr.responseText);
-                    if (response.success) {
-                        alert('删除成功！');
-                        loadIpLocationData(1); // 重新加载第一页数据
-                    } else {
-                        alert('删除失败：' + (response.message || '未知错误'));
-                    }
-                } catch (e) {
-                    alert('删除失败：数据解析错误');
-                }
-            } else {
-                alert('删除失败：请求错误');
-            }
-        }
-    };
-    
-    xhr.send('action=delete_ip_location&ip=' + encodeURIComponent(ip));
-}
-
-// IP时间范围切换函数
-function changeIpTimeRange() {
-    const timeRange = document.getElementById('ip_time_range').value;
-    const currentUrl = new URL(window.location.href);
-    
-    if (timeRange === 'all') {
-        currentUrl.searchParams.delete('ip_time_range');
-    } else {
-        currentUrl.searchParams.set('ip_time_range', timeRange);
-    }
-    
-    window.location.href = currentUrl.toString();
-}
-
-// 访问来源时间范围切换函数
-function changeRefererTimeRange() {
-    const timeRange = document.getElementById('referer_time_range').value;
-    const currentUrl = new URL(window.location.href);
-    
-    if (timeRange === '7') {
-        currentUrl.searchParams.delete('referer_time_range'); // 7天是默认值，删除参数
-    } else {
-        currentUrl.searchParams.set('referer_time_range', timeRange);
-    }
-    
-    window.location.href = currentUrl.toString();
-}
-
-// 统一时间范围切换函数
-function changeGlobalTimeRange() {
-    const timeRange = document.getElementById('global_time_range').value;
-    const currentUrl = new URL(window.location.href);
-    
-    // 同时设置地域分布、访问来源、IP统计和热门文章的时间范围
-    if (timeRange === '7') {
-        // 7天是默认值，删除参数
-        currentUrl.searchParams.delete('location_time_range');
-        currentUrl.searchParams.delete('article_time_range');
-        currentUrl.searchParams.delete('referer_time_range');
-        currentUrl.searchParams.delete('ip_time_range');
-    } else {
-        currentUrl.searchParams.set('location_time_range', timeRange);
-        currentUrl.searchParams.set('article_time_range', timeRange);
-        currentUrl.searchParams.set('referer_time_range', timeRange);
-        currentUrl.searchParams.set('ip_time_range', timeRange);
-    }
-    
-    window.location.href = currentUrl.toString();
-}
-
-// 地域分布时间范围切换函数
-function changeLocationTimeRange() {
-    const timeRange = document.getElementById('location_time_range').value;
-    const currentUrl = new URL(window.location.href);
-    
-    if (timeRange === '7') {
-        currentUrl.searchParams.delete('location_time_range'); // 7天是默认值，删除参数
-    } else {
-        currentUrl.searchParams.set('location_time_range', timeRange);
-    }
-    
-    window.location.href = currentUrl.toString();
-}
-
-// 热门文章时间范围切换函数
-function changeArticleTimeRange() {
-    const timeRange = document.getElementById('article_time_range').value;
-    const currentUrl = new URL(window.location.href);
-    
-    if (timeRange === '7') {
-        currentUrl.searchParams.delete('article_time_range'); // 7天是默认值，删除参数
-    } else {
-        currentUrl.searchParams.set('article_time_range', timeRange);
-    }
-    
-    window.location.href = currentUrl.toString();
-}
-
-// 页面加载时设置统一时间选择器的默认值
-document.addEventListener('DOMContentLoaded', function() {
-    const globalTimeRange = document.getElementById('global_time_range');
-    if (globalTimeRange) {
-        const urlParams = new URLSearchParams(window.location.search);
-        const locationRange = urlParams.get('location_time_range') || '7';
-        const articleRange = urlParams.get('article_time_range') || '7';
-        const refererRange = urlParams.get('referer_time_range') || '7';
-        const ipRange = urlParams.get('ip_time_range') || '7';
-        
-        // 如果所有模块的时间范围一致，则设置统一选择器
-        if (locationRange === articleRange && articleRange === refererRange && refererRange === ipRange) {
-            globalTimeRange.value = locationRange;
-        } else {
-            // 如果不一致，默认设置为7天
-            globalTimeRange.value = '7';
-        }
-    }
-});
-
-
+var weekData = <?php echo json_encode($week_data); ?>;
+var monthlyStatsData = <?php echo json_encode($monthly_stats); ?>;
 </script>
+<script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/panel.js'); ?>"></script>
 
 <?php include_once __TYPECHO_ROOT_DIR__ . '/admin/footer.php'; ?>

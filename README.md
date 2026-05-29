@@ -16,8 +16,8 @@
 - 🛡️ 访问频率限制和防刷量保护
 - 📊 访问来源统计和分析（搜索引擎、社交媒体、外部链接等）
 - 💾 本地IP归属地数据库，减少外部API依赖
-- ⚡ 异步IP查询机制，不影响页面加载速度
-- 🔄 多IP查询接口支持（IP138、ip-api.com等）
+- ⚡ 浏览器异步追踪像素，IP查询不阻塞页面加载
+- 🔄 多IP查询接口支持（IP138需token、ip-api.com免费）
 - ⚙️ 灵活的配置选项
 - 🗂️ 完善的数据管理和清理功能
 
@@ -78,7 +78,7 @@
 - **本地IP数据库**: 启用/禁用本地IP归属地数据库，优先从本地查询以提高性能
 - **IP归属地缓存天数**: 本地IP归属地数据的缓存天数
 - **自动清理IP数据**: 启用/禁用自动清理过期的IP归属地数据
-- **异步IP查询**: 自动启用，优先从本地缓存查询，异步更新未缓存的IP归属地
+- **异步IP查询**: 首次访问未知IP时，插件通过浏览器异步加载追踪像素查询归属地，不阻塞页面加载
 - **访问频率限制**: 启用/禁用高频访问拦截功能，防止恶意刷量
 - **限流窗口时间**: 统计访问频率的时间窗口（秒）
 - **限流阈值**: 在窗口时间内允许的最大访问次数
@@ -224,17 +224,18 @@ RecentViewsCounter_Plugin::getRefererStats($days);
 
 ### 获取IP归属地信息
 ```php
-RecentViewsCounter_Plugin::getIpLocation($ip);
+// IP 定位类库（lib/IpLookup.php）
+RecentViewsCounter_IpLookup::getIpLocation($ip);
 ```
 
 ### 异步更新IP归属地信息
 ```php
-RecentViewsCounter_Plugin::updateIpLocationAsync($ip);
+RecentViewsCounter_IpLookup::updateIpLocationAsync($ip);
 ```
 
 ### 使用IP138接口查询IP归属地
 ```php
-RecentViewsCounter_Plugin::getIpLocationFromIp138($ip);
+RecentViewsCounter_IpLookup::getIpLocationFromIp138($ip);
 ```
 
 ### 获取数据库统计信息
@@ -295,7 +296,7 @@ RecentViewsCounter_Plugin::manualCleanOldRecords($days);
 
 ## 注意事项
 
-- **异步IP查询**: 插件采用异步方式查询IP归属地，首次访问时可能显示为空，后续访问会显示正确的归属地信息
+- **异步IP查询**: 未知IP通过浏览器异步追踪像素查询归属地，首次访问可能显示为空，后续访问显示正确归属地信息
 - 插件会自动清理过期记录，无需手动维护
 - 插件会自动排除管理员的访问记录
 - 清理操作不可恢复，请谨慎操作
@@ -307,16 +308,28 @@ RecentViewsCounter_Plugin::manualCleanOldRecords($days);
 - 本地IP数据库会占用一定存储空间，可根据需要启用自动清理
 - 访问来源统计依赖HTTP Referer头，某些情况下可能不准确
 - **IP查询接口**: 插件优先使用IP138接口，备用ip-api.com接口，确保查询成功率
-- **性能优化**: 异步查询机制确保页面加载速度不受IP查询影响
+- **性能优化**: 浏览器异步加载追踪像素，页面响应不受IP查询影响
 
 ## 版本信息
 
-- 版本: 1.0.0
+- 版本: 1.1.0
 - 兼容: Typecho 1.0+
 - 作者: chenjim
 - 插件地址: https://github.com/chenjim/RecentViewsCounter
 
 ## 更新日志
+
+### v1.1.0 (2026-05-29)
+- 🛡️ IP黑名单功能完善：SQLite唯一索引、filter_var校验、403/429状态码修复
+- 🎨 黑名单管理合并到统计面板（标签切换），删除独立 BlacklistPanel.php
+- 🔍 IP详情弹窗新增「加入黑名单」按钮
+- 📦 JS独立提取到 assets/panel.js（Panel.php 代码量减少 43%）
+- ♻️ IP定位方法提取到 lib/IpLookup.php（Plugin.php 代码量减少 25%）
+- ⚡ 改用浏览器异步追踪像素更新IP归属地，移除阻塞式 shutdown 调用
+- 🔧 ip-api.com 改用 HTTP（免费版不支持 HTTPS）
+- 📝 插件配置说明和 README 同步更新
+
+> **升级提示**：升级到 v1.1.0 后，请在后台 **停用并重新启用** 插件，否则新增的浏览器异步追踪像素和统计面板路由不会生效。
 
 ### v1.0.0 (2025-08-25)
 - 🎉 初始版本发布

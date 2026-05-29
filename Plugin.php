@@ -1,16 +1,23 @@
 <?php
 if (!defined('__TYPECHO_ROOT_DIR__')) exit;
+require_once dirname(__FILE__) . '/Blacklist.php';
+require_once dirname(__FILE__) . '/lib/IpLookup.php';
 
 /**
  * 文章近期浏览量统计插件，记录每次访问的详细信息，包括IP地址和归属地
  *
  * @package RecentViewsCounter
  * @author  chenjim
- * @version 1.0.0
+ * @version 1.1.0
  * @link https://github.com/chenjim/RecentViewsCounter
  */
 class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
 {
+    // Bot判定阈值：UA匹配 或 行为评分 ≥ 此值 即标记为Bot
+    const BOT_THRESHOLD = 30;
+
+    private static $beaconNeeded = false;
+
     /**
      * 激活插件方法,如果激活失败,直接抛出异常
      *
@@ -21,6 +28,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         try {
             // 创建访问记录表
             self::createTable();
+            
+            // 执行数据库升级（索引、字段迁移等）
+            self::upgradeDatabase();
             
             // 绑定限流检查到index.php的begin钩子（在路由分发前执行）
             Typecho_Plugin::factory('index.php')->begin = array(
@@ -34,10 +44,10 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                 'recordVisit'
             );
             
-            // 绑定定时清理钩子到不同的事件
+            // 绑定定时清理和异步IP更新钩子
             Typecho_Plugin::factory('Widget_Archive')->footer = array(
                 'RecentViewsCounter_Plugin',
-                'cleanOldRecords'
+                'handleFooter'
             );
             
             // 添加管理菜单
@@ -80,10 +90,11 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             $prefix = $db->getPrefix();
             $driver = $db->getAdapterName();
             $isSqlite = stripos($driver, 'sqlite') !== false;
+            $auto_inc = $isSqlite ? 'AUTOINCREMENT' : 'AUTO_INCREMENT';
 
             // 创建访问记录表
             $sql = "CREATE TABLE IF NOT EXISTS `{$prefix}views_records` (
-                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `id` INTEGER NOT NULL PRIMARY KEY {$auto_inc},
                 `cid` INTEGER NOT NULL,
                 `visit_time` INTEGER NOT NULL,
                 `ip` TEXT NOT NULL,
@@ -94,13 +105,11 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             if (!$isSqlite) {
                 $sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
             }
-            
-            error_log('RecentViewsCounter: 执行创建views_records表SQL');
             $db->query($sql);
             
             // 创建月度统计表
             $monthly_sql = "CREATE TABLE IF NOT EXISTS `{$prefix}monthly_stats` (
-                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `id` INTEGER NOT NULL PRIMARY KEY {$auto_inc},
                 `year_month` TEXT NOT NULL,
                 `total_visits` INTEGER NOT NULL DEFAULT 0,
                 `unique_visitors` INTEGER NOT NULL DEFAULT 0,
@@ -110,13 +119,11 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             if (!$isSqlite) {
                 $monthly_sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
             }
-            
-            error_log('RecentViewsCounter: 执行创建monthly_stats表SQL');
             $db->query($monthly_sql);
             
             // 创建IP归属地本地数据库表
             $ip_location_sql = "CREATE TABLE IF NOT EXISTS `{$prefix}ip_location` (
-                `id` INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                `id` INTEGER NOT NULL PRIMARY KEY {$auto_inc},
                 `ip` TEXT NOT NULL,
                 `location` TEXT NOT NULL,
                 `country` TEXT,
@@ -129,10 +136,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             if (!$isSqlite) {
                 $ip_location_sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
             }
-            
-            error_log('RecentViewsCounter: 执行创建ip_location表SQL');
             $db->query($ip_location_sql);
-            error_log('RecentViewsCounter: 数据表创建完成');
+            // 创建IP黑名单表
+            RecentViewsCounter_Blacklist::createTable();
         } catch (Exception $e) {
             error_log('RecentViewsCounter createTable错误: ' . $e->getMessage());
             throw $e;
@@ -147,27 +153,44 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         try {
             $db = Typecho_Db::get();
             $prefix = $db->getPrefix();
-            
-            error_log('RecentViewsCounter: 开始数据库升级检查');
-            
-            // 检查referer字段是否存在
-            try {
-                $columns = $db->fetchAll("SHOW COLUMNS FROM `{$prefix}views_records` LIKE 'referer'");
-                if (empty($columns)) {
-                    error_log('RecentViewsCounter: referer字段不存在，开始添加');
-                    // 添加referer字段
-                    $db->query("ALTER TABLE `{$prefix}views_records` ADD COLUMN `referer` varchar(500) DEFAULT NULL COMMENT '访问来源URL' AFTER `user_agent`");
-                    // 添加索引
-                    $db->query("ALTER TABLE `{$prefix}views_records` ADD INDEX `idx_referer` (`referer`(255))");
-                    error_log('RecentViewsCounter: referer字段和索引添加完成');
-                } else {
-                    error_log('RecentViewsCounter: referer字段已存在，跳过添加');
-                }
-            } catch (Exception $e) {
-                error_log('RecentViewsCounter: 检查或添加referer字段时出错: ' . $e->getMessage());
+            $driver = $db->getAdapterName();
+            $isSqlite = stripos($driver, 'sqlite') !== false;
+
+            // 创建性能索引（重复执行时静默跳过）
+            $indexes = array(
+                "idx_vr_cid_time" => "ON {$prefix}views_records (cid, visit_time)",
+                "idx_vr_ip_time"  => "ON {$prefix}views_records (ip, visit_time)",
+                "idx_vr_time"     => "ON {$prefix}views_records (visit_time)",
+            );
+            foreach ($indexes as $name => $def) {
+                $sql = $isSqlite
+                    ? "CREATE INDEX IF NOT EXISTS {$name} {$def}"
+                    : "CREATE INDEX {$name} {$def}";
+                try { $db->query($sql); } catch (Exception $e) {}
             }
-            
-            error_log('RecentViewsCounter: 数据库升级检查完成');
+
+            // 检查referer字段是否存在（仅MySQL，SQLite自动跳过）
+            if (!$isSqlite) {
+                try {
+                    $columns = $db->fetchAll("SHOW COLUMNS FROM `{$prefix}views_records` LIKE 'referer'");
+                    if (empty($columns)) {
+                        $db->query("ALTER TABLE `{$prefix}views_records` ADD COLUMN `referer` varchar(500) DEFAULT NULL COMMENT '访问来源URL' AFTER `user_agent`");
+                        $db->query("ALTER TABLE `{$prefix}views_records` ADD INDEX `idx_referer` (`referer`(255))");
+                    }
+                } catch (Exception $e) {
+                    error_log('RecentViewsCounter: 检查或添加referer字段时出错: ' . $e->getMessage());
+                }
+            }
+
+            // IP黑名单唯一索引迁移（兼容旧表无索引的情况）
+            try {
+                $bl_unique_sql = $isSqlite
+                    ? "CREATE UNIQUE INDEX IF NOT EXISTS `idx_ip_blacklist_ip` ON `{$prefix}ip_blacklist` (`ip`)"
+                    : "ALTER TABLE `{$prefix}ip_blacklist` ADD UNIQUE INDEX `idx_ip_blacklist_ip` (`ip`)";
+                $db->query($bl_unique_sql);
+            } catch (Exception $e) {
+                error_log('RecentViewsCounter: IP黑名单唯一索引迁移失败，可能存在重复IP: ' . $e->getMessage());
+            }
         } catch (Exception $e) {
             error_log('RecentViewsCounter upgradeDatabase错误: ' . $e->getMessage());
             // 静默处理错误，避免影响插件启用
@@ -205,7 +228,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             ),
             '1',
             _t('IP归属地查询'),
-            _t('是否启用IP归属地查询功能（需要网络连接）')
+            _t('是否启用IP归属地查询。未知IP通过浏览器异步请求查询接口，不阻塞页面加载')
         );
         
         $top_count = new Typecho_Widget_Helper_Form_Element_Text(
@@ -332,14 +355,25 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             _t('统计访问频率的时间窗口，默认60秒')
         );
         
-        $rate_limit_threshold = new Typecho_Widget_Helper_Form_Element_Text(
+            $rate_limit_threshold = new Typecho_Widget_Helper_Form_Element_Text(
             'rate_limit_threshold',
             NULL,
-            10,
+            30,
             _t('限流阈值（次数）'),
             _t('在窗口时间内允许的最大访问次数，超过则返回429状态码')
         );
         
+        $enable_blacklist = new Typecho_Widget_Helper_Form_Element_Radio(
+            'enable_ip_blacklist',
+            array(
+                '1' => '启用',
+                '0' => '禁用'
+            ),
+            '1',
+            _t('IP黑名单拦截'),
+            _t('是否启用IP黑名单功能，黑名单中的IP将被禁止访问并跳过统计')
+        );
+
         $ip138_token = new Typecho_Widget_Helper_Form_Element_Text(
             'ip138_token',
             NULL,
@@ -349,6 +383,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         );
         
         $form->addInput($enable_location);
+        $form->addInput($enable_blacklist);
         $form->addInput($ip138_token);
         $form->addInput($enable_local_ip_db);
         $form->addInput($ip_cache_days);
@@ -380,31 +415,33 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
      */
     public static function checkRateLimit()
     {
-        // 添加调试日志
-        error_log('RecentViewsCounter: checkRateLimit被调用');
-        
         // 排除管理员访问
         if (Typecho_Widget::widget('Widget_User')->hasLogin()) {
-            error_log('RecentViewsCounter: 管理员访问，跳过限流检查');
             return;
         }
         
-        $ip = self::getClientIp();
+        $ip = RecentViewsCounter_IpLookup::getClientIp();
         $current_time = time();
-        error_log('RecentViewsCounter: 检查IP ' . $ip . ' 的访问频率');
         
         // 获取插件配置
         $db = Typecho_Db::get();
         $options = Typecho_Widget::widget('Widget_Options');
         $plugin_config = $options->plugin('RecentViewsCounter');
         
+        // IP黑名单拦截
+        if ($plugin_config && $plugin_config->enable_ip_blacklist == '1' && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
+            while (ob_get_level()) ob_end_clean();
+            header('HTTP/1.1 403 Forbidden', true, 403);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo '403 您的IP已被列入黑名单，访问被拒绝。';
+            exit;
+        }
+        
         // 高频访问硬拦截
         if ($plugin_config && $plugin_config->enable_rate_limit == '1') {
-            error_log('RecentViewsCounter: 限流功能已启用');
             try {
                 $rateWindow = $plugin_config->rate_limit_window ? intval($plugin_config->rate_limit_window) : 60;
                 $rateLimit = $plugin_config->rate_limit_threshold ? intval($plugin_config->rate_limit_threshold) : 10;
-                error_log('RecentViewsCounter: 限流配置 - 窗口时间: ' . $rateWindow . '秒, 阈值: ' . $rateLimit . '次');
                 
                 $row = $db->fetchRow(
                     $db->select('COUNT(*) as count')
@@ -413,32 +450,18 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                        ->where('visit_time >= ?', $current_time - $rateWindow)
                 );
                 $recentCount = isset($row['count']) ? intval($row['count']) : 0;
-                error_log('RecentViewsCounter: IP ' . $ip . ' 在过去 ' . $rateWindow . ' 秒内访问了 ' . $recentCount . ' 次');
                 
                 if ($recentCount >= $rateLimit) {
-                    error_log('RecentViewsCounter: 触发限流！访问次数 ' . $recentCount . ' >= 阈值 ' . $rateLimit);
-                    if (!headers_sent()) {
-                        // 设置HTTP状态码和响应头
-                        http_response_code(429);
-                        header('HTTP/1.1 429 Too Many Requests');
-                        header('Retry-After: ' . $rateWindow);
-                        header('Content-Type: text/plain; charset=utf-8');
-                        echo '请求过于频繁，请稍后再试。';
-                    } else {
-                        // 如果headers已发送，只能输出错误信息
-                        echo '<script>console.error("Rate limit exceeded: 429 Too Many Requests");</script>';
-                        echo '请求过于频繁，请稍后再试。';
-                    }
+                    while (ob_get_level()) ob_end_clean();
+                    header('HTTP/1.1 429 Too Many Requests', true, 429);
+                    header('Retry-After: ' . $rateWindow);
+                    header('Content-Type: text/plain; charset=utf-8');
+                    echo '429 请求过于频繁，请稍后再试。';
                     exit;
-                } else {
-                    error_log('RecentViewsCounter: 访问正常，未触发限流');
                 }
             } catch (Exception $e) {
                 error_log('RecentViewsCounter: 限流检查异常: ' . $e->getMessage());
-                // 忽略限流统计过程中的异常，避免影响正常访问
             }
-        } else {
-            error_log('RecentViewsCounter: 限流功能未启用或配置不存在');
         }
     }
     
@@ -447,10 +470,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
      */
     public static function handleIndexBegin()
     {
-        // 添加调试日志
-        error_log('RecentViewsCounter: handleIndexBegin被调用');
-        
-        // 执行限流检查
         self::checkRateLimit();
     }
     
@@ -465,7 +484,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         }
 
         $cid = $archive_obj->cid;
-        $ip = self::getClientIp();
+        $ip = RecentViewsCounter_IpLookup::getClientIp();
         $current_time = time();
         
         // 检查是否为重复访问
@@ -478,17 +497,22 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $options = Typecho_Widget::widget('Widget_Options');
         $plugin_config = $options->plugin('RecentViewsCounter');
 
+        // IP黑名单拦截（不记录访问）
+        if ($plugin_config && $plugin_config->enable_ip_blacklist == '1' && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
+            return;
+        }
+
         // 快速获取IP归属地（优先本地缓存）
         $location = null;
         if ($plugin_config && $plugin_config->enable_location == '1') {
             // 检查是否为内网IP
             if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1') {
                 $location = '本地';
-            } elseif (self::isPrivateIp($ip)) {
+            } elseif (RecentViewsCounter_IpLookup::isPrivateIp($ip)) {
                 $location = '内网';
             } else {
                 // 尝试从本地数据库快速查询
-                $local_result = self::getIpLocationFromLocal($ip);
+                $local_result = RecentViewsCounter_IpLookup::getIpLocationFromLocal($ip);
                 if ($local_result && !empty($local_result['location'])) {
                     $location = $local_result['location'];
                 }
@@ -522,10 +546,10 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             
             // 自动更新当月统计
             self::autoUpdateCurrentMonthStats();
-            
-            // 如果IP归属地为空且需要查询，则异步更新
-            if ($location === null && $plugin_config && $plugin_config->enable_location == '1') {
-                register_shutdown_function(array('RecentViewsCounter_Plugin', 'updateIpLocationAsync'), $ip);
+
+            // 标记需要异步查询IP归属地（浏览器 <img> 异步触发）
+            if ($plugin_config && $plugin_config->enable_location == '1' && $location === null) {
+                self::$beaconNeeded = true;
             }
         } catch (Exception $e) {
             error_log('RecentViewsCounter: 记录访问信息时出错: ' . $e->getMessage());
@@ -533,397 +557,36 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     }
 
     /**
-     * 获取客户端真实IP
-     */
-    private static function getClientIp()
-    {
-        $ip = '';
-        if (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            $ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-            $ip = trim($ips[0]);
-        } elseif (isset($_SERVER['HTTP_X_REAL_IP']) && !empty($_SERVER['HTTP_X_REAL_IP'])) {
-            $ip = $_SERVER['HTTP_X_REAL_IP'];
-        } elseif (isset($_SERVER['REMOTE_ADDR'])) {
-            $ip = $_SERVER['REMOTE_ADDR'];
-        }
-        
-        return $ip;
-    }
-
-    /**
      * 检查是否为重复访问
      */
     private static function isDuplicateVisit($cid, $ip, $current_time)
     {
-        // 检查Cookie
         $cookie_key = "views_month_{$cid}_{$ip}";
         if (Typecho_Cookie::get($cookie_key)) {
             return true;
         }
-        
+
         return false;
     }
 
     /**
-     * 从本地数据库查询IP归属地
+     * 统一 footer 处理：清理 + 异步IP beacon
      */
-    private static function getIpLocationFromLocal($ip)
+    public static function handleFooter()
     {
-        if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1') {
-            return null;
-        }
-        
-        try {
-            $db = Typecho_Db::get();
-            $prefix = $db->getPrefix();
-            
-            $result = $db->fetchRow($db->select('location', 'country', 'region', 'city', 'isp', 'updated_time')
-                ->from($prefix . 'ip_location')
-                ->where('ip = ?', $ip));
-            
-            if ($result) {
-                return $result;
-            }
-        } catch (Exception $e) {
-            error_log('RecentViewsCounter: 本地IP查询错误: ' . $e->getMessage());
-        }
-        
-        return null;
-    }
-    
-    /**
-     * 保存IP归属地到本地数据库
-     */
-    private static function saveIpLocationToLocal($ip, $location, $country = null, $region = null, $city = null, $isp = null)
-    {
-        if (empty($ip) || empty($location)) {
-            return false;
-        }
-        
-        try {
-            $db = Typecho_Db::get();
-            $prefix = $db->getPrefix();
-            $current_time = time();
-            
-            // 检查IP是否已存在
-            $exists = $db->fetchRow($db->select('id')
-                ->from($prefix . 'ip_location')
-                ->where('ip = ?', $ip));
-            
-            if ($exists) {
-                // 更新现有记录
-                $db->query($db->update($prefix . 'ip_location')
-                    ->rows(array(
-                        'location' => $location,
-                        'country' => $country,
-                        'region' => $region,
-                        'city' => $city,
-                        'isp' => $isp,
-                        'updated_time' => $current_time
-                    ))
-                    ->where('ip = ?', $ip));
-            } else {
-                // 插入新记录
-                $db->query($db->insert($prefix . 'ip_location')
-                    ->rows(array(
-                        'ip' => $ip,
-                        'location' => $location,
-                        'country' => $country,
-                        'region' => $region,
-                        'city' => $city,
-                        'isp' => $isp,
-                        'created_time' => $current_time,
-                        'updated_time' => $current_time
-                    )));
-            }
-            
-            return true;
-        } catch (Exception $e) {
-            error_log('RecentViewsCounter: 保存IP归属地错误: ' . $e->getMessage());
-            return false;
-        }
-    }
-    
-    /**
-     * 异步更新IP归属地
-     */
-    public static function updateIpLocationAsync($ip)
-    {
-        if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1' || self::isPrivateIp($ip)) {
-            return;
-        }
-        
-        try {
-            // 查询IP归属地
-            $location_data = self::getIpLocationFromApi($ip);
-            if ($location_data && !empty($location_data['location'])) {
-                $db = Typecho_Db::get();
-                
-                // 保存到本地数据库
-                self::saveIpLocationToLocal(
-                    $ip,
-                    $location_data['location'],
-                    $location_data['country'],
-                    $location_data['region'],
-                    $location_data['city'],
-                    $location_data['isp']
-                );
-                
-                // 更新访问记录中的IP归属地
-                $db->query($db->update('table.views_records')
-                              ->rows(array('location' => $location_data['location']))
-                              ->where('ip = ? AND (location IS NULL OR location = "")', $ip));
-            }
-        } catch (Exception $e) {
-            error_log('RecentViewsCounter: 异步更新IP归属地错误: ' . $e->getMessage());
-        }
-    }
-    
-    /**
-     * 从IP138 API获取IP归属地
-     */
-    private static function getIpLocationFromIp138($ip)
-    {
-        if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1') {
-            return null;
-        }
-        
-        try {
-             // 使用IP138 API
-             $options = Typecho_Widget::widget('Widget_Options');
-             $plugin_config = $options->plugin('RecentViewsCounter');
-             $token = ($plugin_config && !empty($plugin_config->ip138_token)) ? $plugin_config->ip138_token : '';
-             
-             // 如果没有配置token，则跳过IP138 API调用
-             if (empty($token)) {
-                 throw new Exception('IP138 token not configured');
-             }
-             
-             $url = "https://api.ip138.com/ipdata/?ip={$ip}&datatype=jsonp&token={$token}";
-            
-            $context = stream_context_create(array(
-                'http' => array(
-                    'timeout' => 2,
-                    'method' => 'GET',
-                    'header' => "User-Agent: Mozilla/5.0 (compatible; RecentViewsCounter/1.0)\r\n"
-                )
-            ));
-            
-            $response = @file_get_contents($url, false, $context);
-            if ($response) {
-                // IP138返回的是JSONP格式，需要提取JSON部分
-                if (preg_match('/\((.+)\)/', $response, $matches)) {
-                    $json_data = $matches[1];
-                    $data = json_decode($json_data, true);
-                    
-                    if ($data && isset($data['ret']) && $data['ret'] == 'ok' && isset($data['data'])) {
-                        $location_info = $data['data'];
-                        $location_parts = array();
-                        
-                        if (!empty($location_info[0])) $location_parts[] = $location_info[0]; // 国家
-                        if (!empty($location_info[1])) $location_parts[] = $location_info[1]; // 省份
-                        if (!empty($location_info[2])) $location_parts[] = $location_info[2]; // 城市
-                        
-                        $location = implode(' ', $location_parts);
-                        
-                        return array(
-                            'location' => $location,
-                            'country' => isset($location_info[0]) ? $location_info[0] : null,
-                            'region' => isset($location_info[1]) ? $location_info[1] : null,
-                            'city' => isset($location_info[2]) ? $location_info[2] : null,
-                            'isp' => isset($location_info[4]) ? $location_info[4] : null
-                        );
-                    }
-                }
-            }
-        } catch (Exception $e) {
-            error_log('RecentViewsCounter: IP138 API查询错误: ' . $e->getMessage());
-        }
-        
-        return null;
-    }
-    
-    /**
-     * 从外部API获取IP归属地（支持多个API源）
-     */
-    private static function getIpLocationFromApi($ip)
-    {
-        if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1') {
-            return null;
-        }
-        
-        // 优先使用IP138 API
-        $result = self::getIpLocationFromIp138($ip);
-        if ($result && !empty($result['location'])) {
-            return $result;
-        }
-        
-        // 备用：使用ip-api.com
-        try {
-            $url = "http://ip-api.com/json/{$ip}?lang=zh-CN";
-            $context = stream_context_create(array(
-                'http' => array(
-                    'timeout' => 2,
-                    'method' => 'GET'
-                )
-            ));
-            
-            $response = @file_get_contents($url, false, $context);
-            if ($response) {
-                $data = json_decode($response, true);
-                if ($data && $data['status'] == 'success') {
-                    return array(
-                        'location' => $data['country'] . ' ' . $data['regionName'] . ' ' . $data['city'],
-                        'country' => $data['country'],
-                        'region' => $data['regionName'],
-                        'city' => $data['city'],
-                        'isp' => isset($data['isp']) ? $data['isp'] : null
-                    );
-                }
-            }
-        } catch (Exception $e) {
-            error_log('RecentViewsCounter: ip-api.com查询错误: ' . $e->getMessage());
-        }
-        
-        return null;
+        self::cleanOldRecords();
+        self::injectBeacon();
     }
 
     /**
-     * 检查是否为内网IP
+     * 浏览器异步加载追踪像素，后台更新IP归属地
      */
-    private static function isPrivateIp($ip)
+    private static function injectBeacon()
     {
-        if (empty($ip)) {
-            return false;
+        if (self::$beaconNeeded) {
+            echo '<img src="/usr/plugins/RecentViewsCounter/pixel.php" style="display:none" width="1" height="1" alt="" />';
+            self::$beaconNeeded = false;
         }
-        
-        // 检查IPv4内网IP段
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            $ip_long = ip2long($ip);
-            if ($ip_long === false) {
-                return false;
-            }
-            
-            // 10.0.0.0/8 (10.0.0.0 - 10.255.255.255)
-            if (($ip_long >= ip2long('10.0.0.0')) && ($ip_long <= ip2long('10.255.255.255'))) {
-                return true;
-            }
-            
-            // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-            if (($ip_long >= ip2long('172.16.0.0')) && ($ip_long <= ip2long('172.31.255.255'))) {
-                return true;
-            }
-            
-            // 192.168.0.0/16 (192.168.0.0 - 192.168.255.255)
-            if (($ip_long >= ip2long('192.168.0.0')) && ($ip_long <= ip2long('192.168.255.255'))) {
-                return true;
-            }
-            
-            // 127.0.0.0/8 (127.0.0.0 - 127.255.255.255) 本地回环
-            if (($ip_long >= ip2long('127.0.0.0')) && ($ip_long <= ip2long('127.255.255.255'))) {
-                return true;
-            }
-            
-            // 169.254.0.0/16 (169.254.0.0 - 169.254.255.255) 链路本地地址
-            if (($ip_long >= ip2long('169.254.0.0')) && ($ip_long <= ip2long('169.254.255.255'))) {
-                return true;
-            }
-        }
-        
-        // 检查IPv6内网地址
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-            // ::1 本地回环
-            if ($ip == '::1') {
-                return true;
-            }
-            
-            // fe80::/10 链路本地地址
-            if (substr($ip, 0, 4) == 'fe80') {
-                return true;
-            }
-            
-            // fc00::/7 唯一本地地址
-            if (substr($ip, 0, 2) == 'fc' || substr($ip, 0, 2) == 'fd') {
-                return true;
-            }
-        }
-        
-        return false;
-    }
-
-    /**
-     * 获取IP归属地（优先本地查询，然后API查询并存储）
-     */
-    private static function getIpLocation($ip)
-    {
-        if (empty($ip) || $ip == '127.0.0.1' || $ip == '::1') {
-            return '本地';
-        }
-        
-        // 检查是否为内网IP
-        if (self::isPrivateIp($ip)) {
-            return '内网';
-        }
-        
-        // 获取插件配置
-        $options = Typecho_Widget::widget('Widget_Options');
-        $plugin_options = $options->plugin('RecentViewsCounter');
-        
-        // 检查是否启用本地IP数据库
-        $enable_local_db = $plugin_options && $plugin_options->enable_local_ip_db == '1';
-        
-        if ($enable_local_db) {
-            // 首先尝试从本地数据库查询
-            $local_result = self::getIpLocationFromLocal($ip);
-            if ($local_result && !empty($local_result['location'])) {
-                // 检查数据是否过期（如果配置了缓存天数）
-                if ($plugin_options && $plugin_options->ip_cache_days) {
-                    $cache_days = intval($plugin_options->ip_cache_days);
-                    $expire_time = time() - ($cache_days * 24 * 3600);
-                    
-                    // 如果数据已过期，重新查询
-                    if (isset($local_result['updated_time']) && $local_result['updated_time'] < $expire_time) {
-                        $api_result = self::getIpLocationFromApi($ip);
-                        if ($api_result && !empty($api_result['location'])) {
-                            self::saveIpLocationToLocal(
-                                $ip,
-                                $api_result['location'],
-                                $api_result['country'],
-                                $api_result['region'],
-                                $api_result['city'],
-                                $api_result['isp']
-                            );
-                            return $api_result['location'];
-                        }
-                    }
-                }
-                
-                return $local_result['location'];
-            }
-            
-            // 本地没有找到，尝试从API查询并保存
-            $api_result = self::getIpLocationFromApi($ip);
-            if ($api_result && !empty($api_result['location'])) {
-                self::saveIpLocationToLocal(
-                    $ip,
-                    $api_result['location'],
-                    $api_result['country'],
-                    $api_result['region'],
-                    $api_result['city'],
-                    $api_result['isp']
-                );
-                
-                return $api_result['location'];
-            }
-        } else {
-            // 不使用本地数据库，直接从API查询
-            $api_result = self::getIpLocationFromApi($ip);
-            if ($api_result && !empty($api_result['location'])) {
-                return $api_result['location'];
-            }
-        }
-        
-        return 'Unknown';
     }
 
     /**
@@ -1089,7 +752,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
      */
     public static function cleanOldRecords()
     {
-        // 使用静态变量避免重复执行
         static $cleaned = false;
         if ($cleaned) {
             return;
@@ -1098,18 +760,16 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $options = Typecho_Widget::widget('Widget_Options');
         $plugin_config = $options->plugin('RecentViewsCounter');
         
-        // 检查是否启用自动清理
         if (!$plugin_config || $plugin_config->auto_clean != '1') {
             $cleaned = true;
             return;
         }
         
-        // 获取保留天数配置
         $clean_days = $plugin_config->clean_days ? intval($plugin_config->clean_days) : 30;
         $cutoff_time = time() - ($clean_days * 24 * 3600);
         
-        // 随机执行清理（约1%的概率），避免每次访问都执行
-        if (rand(1, 100) <= 1) {
+        // 随机执行清理（约2%的概率），避免每次访问都执行
+        if (rand(1, 100) <= 2) {
             $db = Typecho_Db::get();
             try {
                 $db->query($db->delete('table.views_records')
@@ -1200,11 +860,16 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                                             ->where('visit_time >= ?', $start_time)
                                             ->where('visit_time <= ?', $end_time));
             
-            // 统计该月独立访客数
-            $unique_visitors = $db->fetchRow($db->select('COUNT(DISTINCT ip) as count')
-                                               ->from('table.views_records')
-                                               ->where('visit_time >= ?', $start_time)
-                                               ->where('visit_time <= ?', $end_time));
+            // 统计该月非Bot访问数（排除匹配Bot UA的记录数）
+            $bot_conds = array();
+            $prefix_tmp = $db->getPrefix();
+            foreach (self::getBotPatterns() as $p) {
+                $bot_conds[] = "LOWER(user_agent) LIKE '%" . strtolower($p) . "%'";
+            }
+            $bot_sql = "SELECT COUNT(*) as count FROM {$prefix_tmp}views_records WHERE (" . implode(' OR ', $bot_conds) . ") AND visit_time >= " . intval($start_time) . " AND visit_time <= " . intval($end_time);
+            $bot_visit_count = $db->fetchRow($db->query($bot_sql));
+            // unique_visitors 实际存储非Bot访问数（总访问量 - Bot UA匹配数），非字面独立访客
+            $unique_visitors = array('count' => intval($total_visits['count']) - intval($bot_visit_count['count']));
             
             $current_time = time();
             
@@ -1274,7 +939,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
      */
     public static function autoUpdateCurrentMonthStats()
     {
-        // 使用静态变量避免重复执行
         static $updated = false;
         if ($updated) {
             return;
@@ -1376,6 +1040,37 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     }
 
     /**
+     * 获取Bot UA模式列表（单一定义，多处复用）
+     */
+    public static function getBotPatterns()
+    {
+        return array(
+            'Googlebot', 'Bingbot', 'Slurp', 'DuckDuckBot', 'Baiduspider',
+            'YandexBot', 'YandexAccessibilityBot', 'YandexMobileBot', 'YandexDirectDyn',
+            'facebookexternalhit', 'Twitterbot', 'rogerbot', 'linkedinbot',
+            'embedly', 'quora link preview', 'showyoubot', 'outbrain', 'pinterest',
+            'developers.google.com/+/web/snippet', 'slackbot', 'vkShare',
+            'W3C_Validator', 'redditbot', 'Applebot', 'WhatsApp', 'flipboard',
+            'tumblr', 'bitlybot', 'SkypeUriPreview', 'nuzzel', 'Discordbot',
+            'Google Page Speed', 'Qwantify', 'pinterestbot', 'Bitrix link preview',
+            'XING-contenttabreceiver', 'Chrome-Lighthouse', 'TelegramBot',
+            'SemrushBot', 'AhrefsBot', 'MJ12bot', 'DotBot', 'Mediapartners-Google',
+            'AdsBot-Google', 'Googlebot-News', 'Googlebot-Image', 'Googlebot-Video',
+            'Googlebot-Mobile', 'msnbot', 'bingbot', 'ia_archiver', 'Wayback',
+            'archive.org_bot', 'CCBot', 'SeznamBot', 'MojeekBot', 'DuckDuckGo-Favicons-Bot',
+            'Baiduspider-render', 'Baiduspider-image', 'Baiduspider-news', 'Baiduspider-video',
+            'Sogou web spider', 'Sogou News Spider', 'Sogou Pic Spider', 'Sogou Video Spider',
+            'HaoSouSpider', '360Spider', 'JikeSpider', 'YisouSpider', 'ToutiaoSpider',
+            'ByteSpider', 'PetalBot',
+            'GPTBot', 'ChatGPT-User', 'ClaudeBot', 'Claude-Web', 'PerplexityBot',
+            'Google-Extended', 'Google-CloudVertex', 'Amazonbot',
+            'Screaming Frog SEO Spider', 'Scrapy', 'python-requests', 'aiohttp',
+            'httpx', 'curl', 'wget', 'Go-http-client', 'fasthttp',
+            'spider', 'crawler', 'bot'
+        );
+    }
+
+    /**
      * 获取来源统计数据
      * @param int $days 统计天数，默认30天
      * @return array 来源统计数组
@@ -1387,9 +1082,8 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $start_time = time() - ($days * 24 * 3600);
 
         try {
-            // 使用原生SQL查询避免Typecho查询构建器的语法问题
             $prefix = $db->getPrefix();
-            $rows = $db->fetchAll($db->query("SELECT `referer` FROM `{$prefix}views_records` WHERE `visit_time` > {$start_time} AND `referer` IS NOT NULL AND `referer` != ''"));
+            $rows = $db->fetchAll($db->query("SELECT `referer`, COUNT(*) AS cnt FROM `{$prefix}views_records` WHERE `visit_time` > {$start_time} AND `referer` IS NOT NULL AND `referer` != '' GROUP BY `referer`"));
 
             $stats = array(
                 'search' => array('count' => 0, 'items' => array()),
@@ -1403,12 +1097,13 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                 $analysis = self::analyzeReferer($row['referer']);
                 $type = $analysis['type'];
                 $name = $analysis['name'];
+                $cnt = intval($row['cnt']);
 
-                $stats[$type]['count']++;
+                $stats[$type]['count'] += $cnt;
                 if (!isset($stats[$type]['items'][$name])) {
                     $stats[$type]['items'][$name] = 0;
                 }
-                $stats[$type]['items'][$name]++;
+                $stats[$type]['items'][$name] += $cnt;
             }
 
             // 统计直接访问
