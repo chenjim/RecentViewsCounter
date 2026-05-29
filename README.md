@@ -167,6 +167,19 @@ if (class_exists('RecentViewsCounter_Plugin')) {
 
 效果参见 <https://h89.cn/>
 
+### 在文章页显示"查看记录"按钮
+
+插件已通过 `Widget_Archive::footer` 钩子自动注入前端 JS（`assets/visit-records.js`），主题无需额外引入。只需在模板中添加链接即可：
+
+```php
+<a href="javascript:void(0)"
+   onclick="showVisitRecords(<?php echo $this->cid; ?>, '<?php echo htmlspecialchars(addslashes($this->title)); ?>')"
+   style="color: #467b96; text-decoration: none;"
+   title="查看该文章的访问记录">查看记录</a>
+```
+
+通常在 `post.php`、`archive.php`、`index.php` 等文章列表模板中添加。
+
 ### 代码说明
 
 - `class_exists('RecentViewsCounter_Plugin')`: 检查插件是否已激活
@@ -320,6 +333,9 @@ RecentViewsCounter_Plugin::manualCleanOldRecords($days);
 ## 更新日志
 
 ### v1.1.0 (2026-05-29)
+- 🛡️ AJAX 端点 Referer 校验覆盖所有 POST 操作，防止外部直接调用获取数据
+- 📦 前端访问记录 JS 独立为 assets/visit-records.js，panel.js 复用统一定义
+- 🧹 从主题 footer.php 移除 ~160 行内联 JS，换主题无需同步迁移
 - 🛡️ IP黑名单功能完善：SQLite唯一索引、filter_var校验、403/429状态码修复
 - 🎨 黑名单管理合并到统计面板（标签切换），删除独立 BlacklistPanel.php
 - 🔍 IP详情弹窗新增「加入黑名单」按钮

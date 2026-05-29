@@ -576,6 +576,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     {
         self::cleanOldRecords();
         self::injectBeacon();
+        self::injectVisitRecordsJs();
     }
 
     /**
@@ -587,6 +588,20 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             echo '<img src="/usr/plugins/RecentViewsCounter/pixel.php" style="display:none" width="1" height="1" alt="" />';
             self::$beaconNeeded = false;
         }
+    }
+
+    /**
+     * 注入前端访问记录查看 JS
+     */
+    private static function injectVisitRecordsJs()
+    {
+        static $injected = false;
+        if ($injected) return;
+        $injected = true;
+
+        $options = Typecho_Widget::widget('Widget_Options');
+        echo '<script>window.RVC_ADMIN_URL="' . htmlspecialchars($options->adminUrl) . '";</script>';
+        echo '<script src="/usr/plugins/RecentViewsCounter/assets/visit-records.js"></script>';
     }
 
     /**

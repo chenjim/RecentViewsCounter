@@ -21,16 +21,13 @@ function parseTimeRangeDays($range) {
     return null;
 }
 
-// CSRF 保护：对修改数据的 POST 请求校验 Referer
+// Referer 校验：所有 POST 请求必须来自本站，防止外部直接调用获取数据
 $request = Typecho_Request::getInstance();
-if ($request->isPost()) {
-    $destructiveActions = array('clean_records', 'clear_cache', 'clean_expired_ip_data', 'delete_ip_location', 'add_to_blacklist', 'remove_from_blacklist', 'get_blacklist');
-    if (in_array($request->get('action'), $destructiveActions)) {
-        $siteHost = parse_url($options->siteUrl, PHP_URL_HOST);
-        $refererHost = $request->getReferer() ? parse_url($request->getReferer(), PHP_URL_HOST) : null;
-        if (!$refererHost || $refererHost !== $siteHost) {
-            die('Forbidden');
-        }
+if ($request->isPost() && $request->get('action')) {
+    $siteHost = parse_url($options->siteUrl, PHP_URL_HOST);
+    $refererHost = $request->getReferer() ? parse_url($request->getReferer(), PHP_URL_HOST) : null;
+    if (!$refererHost || $refererHost !== $siteHost) {
+        die('Forbidden');
     }
 }
 
@@ -1519,6 +1516,7 @@ try {
 var weekData = <?php echo json_encode($week_data); ?>;
 var monthlyStatsData = <?php echo json_encode($monthly_stats); ?>;
 </script>
+<script src="/usr/plugins/RecentViewsCounter/assets/visit-records.js"></script>
 <script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/panel.js'); ?>"></script>
 
 <?php include_once __TYPECHO_ROOT_DIR__ . '/admin/footer.php'; ?>
