@@ -3,6 +3,27 @@ if (!defined('__TYPECHO_ROOT_DIR__')) exit;
 
 class RecentViewsCounter_Blacklist
 {
+    private static function isValidIpOrCidr($ip)
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP)) return true;
+        if (preg_match('#^(\d{1,3}\.){3}\d{1,3}/(\d{1,2})$#', $ip, $m)) {
+            $parts = explode('/', $ip);
+            $mask = intval($parts[1]);
+            return $mask >= 0 && $mask <= 32 && filter_var($parts[0], FILTER_VALIDATE_IP);
+        }
+        return false;
+    }
+
+    private static function ipInCidr($ip, $cidr)
+    {
+        $parts = explode('/', $cidr);
+        $network = ip2long($parts[0]);
+        $ip_long = ip2long($ip);
+        if ($network === false || $ip_long === false) return false;
+        $mask = -1 << (32 - intval($parts[1]));
+        return ($ip_long & $mask) === ($network & $mask);
+    }
+
     public static function createTable()
     {
         try {
@@ -39,7 +60,7 @@ class RecentViewsCounter_Blacklist
 
     public static function add($ip, $reason = '')
     {
-        if (empty($ip) || !filter_var($ip, FILTER_VALIDATE_IP)) return false;
+        if (empty($ip) || !self::isValidIpOrCidr($ip)) return false;
         try {
             $db = Typecho_Db::get();
             $prefix = $db->getPrefix();
@@ -79,8 +100,15 @@ class RecentViewsCounter_Blacklist
         try {
             $db = Typecho_Db::get();
             $prefix = $db->getPrefix();
+
             $row = $db->fetchRow($db->select('id')->from($prefix . 'ip_blacklist')->where('ip = ?', $ip));
-            return !empty($row);
+            if (!empty($row)) return true;
+
+            $cidrs = $db->fetchAll($db->select('ip')->from($prefix . 'ip_blacklist')->where('ip LIKE ?', '%/%'));
+            foreach ($cidrs as $cidr) {
+                if (self::ipInCidr($ip, $cidr['ip'])) return true;
+            }
+            return false;
         } catch (Exception $e) {
             error_log('RecentViewsCounter_Blacklist::isBlacklisted error: ' . $e->getMessage());
             return false;

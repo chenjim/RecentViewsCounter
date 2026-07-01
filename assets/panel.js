@@ -865,6 +865,7 @@ function changeArticleTimeRange() {
 
 // 拉黑/解封 IP（来自 TOP 20 列表）
 function addToBlacklist(ip, el) {
+    var detail = el.getAttribute('data-detail') || '';
     if (!confirm('确定要将 IP "' + ip + '" 加入黑名单吗？加入后该IP将被拦截访问。')) return;
     var xhr = new XMLHttpRequest();
     xhr.open('POST', window.location.href, true);
@@ -883,7 +884,7 @@ function addToBlacklist(ip, el) {
             }
         }
     };
-    xhr.send('action=add_to_blacklist&ip=' + encodeURIComponent(ip));
+    xhr.send('action=add_to_blacklist&ip=' + encodeURIComponent(ip) + '&reason=' + encodeURIComponent(detail));
 }
 
 // 页面加载时设置统一时间选择器的默认值

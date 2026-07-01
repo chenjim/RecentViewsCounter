@@ -130,7 +130,7 @@ class RecentViewsCounter_IpLookup
              $token = ($plugin_config && !empty($plugin_config->ip138_token)) ? $plugin_config->ip138_token : '';
 
              if (empty($token)) {
-                 throw new Exception('IP138 token not configured');
+                  return null;
              }
 
              // ip138 仅支持 HTTPS，需付费 token，直连 443 可能被封锁（需代理）
@@ -183,9 +183,14 @@ class RecentViewsCounter_IpLookup
             return null;
         }
 
-        $result = self::getIpLocationFromIp138($ip);
-        if ($result && !empty($result['location'])) {
-            return $result;
+        $options = Typecho_Widget::widget('Widget_Options');
+        $plugin_config = $options->plugin('RecentViewsCounter');
+        $token = ($plugin_config && !empty($plugin_config->ip138_token)) ? $plugin_config->ip138_token : '';
+        if (!empty($token)) {
+            $result = self::getIpLocationFromIp138($ip);
+            if ($result && !empty($result['location'])) {
+                return $result;
+            }
         }
 
         try {

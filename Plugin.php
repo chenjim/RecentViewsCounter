@@ -16,8 +16,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     // Bot判定阈值：UA匹配 或 行为评分 ≥ 此值 即标记为Bot
     const BOT_THRESHOLD = 30;
 
-    private static $beaconNeeded = false;
-
     /**
      * 激活插件方法,如果激活失败,直接抛出异常
      *
@@ -228,7 +226,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             ),
             '1',
             _t('IP归属地查询'),
-            _t('是否启用IP归属地查询。未知IP通过浏览器异步请求查询接口，不阻塞页面加载')
+            _t('是否启用IP归属地查询。未知IP由服务端后台进程/定时任务回填，不阻塞页面加载')
         );
         
         $top_count = new Typecho_Widget_Helper_Form_Element_Text(
@@ -546,11 +544,6 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             
             // 自动更新当月统计
             self::autoUpdateCurrentMonthStats();
-
-            // 标记需要异步查询IP归属地（浏览器 <img> 异步触发）
-            if ($plugin_config && $plugin_config->enable_location == '1' && $location === null) {
-                self::$beaconNeeded = true;
-            }
         } catch (Exception $e) {
             error_log('RecentViewsCounter: 记录访问信息时出错: ' . $e->getMessage());
         }
@@ -575,23 +568,67 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     public static function handleFooter()
     {
         self::cleanOldRecords();
-        self::injectBeacon();
+        self::triggerIpLocationUpdate();
         self::injectVisitRecordsJs();
     }
 
     /**
-     * 浏览器异步加载追踪像素，后台更新IP归属地
+     * 后台进程触发 IP 归属地回填（绕过广告拦截器）
      */
-    private static function injectBeacon()
+    private static function triggerIpLocationUpdate()
     {
-        if (self::$beaconNeeded) {
-            echo '<img src="/usr/plugins/RecentViewsCounter/pixel.php" style="display:none" width="1" height="1" alt="" />';
-            self::$beaconNeeded = false;
+        static $triggered = false;
+        if ($triggered) return;
+        $triggered = true;
+
+        if (!function_exists('exec')) return;
+
+        try {
+            $options = Typecho_Widget::widget('Widget_Options');
+            $plugin_config = $options->plugin('RecentViewsCounter');
+            if (!$plugin_config || $plugin_config->enable_location != '1') return;
+
+            // 5 分钟内仅触发一次
+            $lockFile = sys_get_temp_dir() . '/rvc_ip_location.lock';
+            $cooldown = 300;
+            if (file_exists($lockFile)) {
+                $mtime = @filemtime($lockFile);
+                if ($mtime && (time() - $mtime) < $cooldown) return;
+            }
+
+            // 非阻塞文件锁，防止并发
+            $fp = @fopen($lockFile, 'c');
+            if (!$fp || !flock($fp, LOCK_EX | LOCK_NB)) {
+                if ($fp) fclose($fp);
+                return;
+            }
+
+            $db = Typecho_Db::get();
+            $prefix = $db->getPrefix();
+            $row = $db->fetchRow($db->query(
+                "SELECT 1 FROM {$prefix}views_records v
+                 WHERE (v.location IS NULL OR v.location = '')
+                   AND v.ip != '' AND v.ip NOT IN ('127.0.0.1','::1')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {$prefix}ip_location l
+                       WHERE l.ip = v.ip AND l.location = 'Unknown'
+                   )
+                 LIMIT 1"
+            ));
+            if (!empty($row)) {
+                $phpBin = PHP_BINDIR . '/php';
+                exec($phpBin . ' ' . escapeshellarg(__DIR__ . '/cron-update-ip-locations.php') . ' > /dev/null 2>&1 &');
+            }
+
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        } catch (Exception $e) {
+            error_log('RecentViewsCounter: triggerIpLocationUpdate error: ' . $e->getMessage());
         }
     }
 
     /**
-     * 注入前端访问记录查看 JS
+     * 注入前端访问记录查看 JS（内联方式，不依赖外部文件加载）
      */
     private static function injectVisitRecordsJs()
     {
@@ -600,8 +637,64 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $injected = true;
 
         $options = Typecho_Widget::widget('Widget_Options');
-        echo '<script>window.RVC_ADMIN_URL="' . htmlspecialchars($options->adminUrl) . '";</script>';
-        echo '<script src="/usr/plugins/RecentViewsCounter/assets/visit-records.js"></script>';
+        $adminUrl = $options->adminUrl;
+        echo <<<EOS
+<script>
+window.RVC_ADMIN_URL="{$adminUrl}";
+function showVisitRecords(cid,title){
+ var modal=document.createElement('div');
+ modal.id='visitRecordsModal';
+ modal.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+ var mc=document.createElement('div');
+ mc.style.cssText='background:white;padding:20px;border-radius:8px;max-width:80%;max-height:80%;overflow:auto;position:relative;';
+ mc.innerHTML='<h3 style="margin-top:0;color:#467b96;">\u6587\u7ae0\u8bbf\u95ee\u8bb0\u5f55</h3><p><strong>\u6587\u7ae0\u6807\u9898\uff1a</strong>'+title+'</p><div id="recordsContent">\u6b63\u5728\u52a0\u8f7d\u8bbf\u95ee\u8bb0\u5f55...</div><button onclick="closeVisitRecords()" style="position:absolute;top:10px;right:15px;background:none;border:none;font-size:20px;cursor:pointer;color:#999;">\u00d7</button><div style="text-align:center;margin-top:20px;"><button onclick="closeVisitRecords()" style="background:#467b96;color:white;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;">\u5173\u95ed</button></div>';
+ modal.appendChild(mc);
+ document.body.appendChild(modal);
+ loadVisitRecords(cid);
+}
+function closeVisitRecords(){
+ var modal=document.getElementById('visitRecordsModal');
+ if(modal)modal.remove();
+}
+function loadVisitRecords(cid){
+ var xhr=new XMLHttpRequest();
+ var base=window.RVC_ADMIN_URL;
+ var url=base?base+'extending.php?panel=RecentViewsCounter%2FPanel.php':window.location.href;
+ xhr.open('POST',url,true);
+ xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+ xhr.onreadystatechange=function(){
+  if(xhr.readyState===4){
+   var el=document.getElementById('recordsContent');
+   if(!el)return;
+   if(xhr.status===200){
+    try{
+     var resp=JSON.parse(xhr.responseText);
+     if(resp.success){displayVisitRecords(resp.data);}
+     else{el.innerHTML='<p style="color:#dc3545;">\u52a0\u8f7d\u5931\u8d25\uff1a'+(resp.message||'\u672a\u77e5\u9519\u8bef')+'</p>';}
+    }catch(e){el.innerHTML='<p style="color:#dc3545;">\u6570\u636e\u89e3\u6790\u5931\u8d25</p>';}
+   }else{el.innerHTML='<p style="color:#dc3545;">\u7f51\u7edc\u8bf7\u6c42\u5931\u8d25</p>';}
+  }
+ };
+ xhr.send('action=get_visit_records&cid='+cid);
+}
+function displayVisitRecords(records){
+ var el=document.getElementById('recordsContent');
+ if(!el)return;
+ if(!records||records.length===0){el.innerHTML='<p>\u6682\u65e0\u8bbf\u95ee\u8bb0\u5f55</p>';return;}
+ var h='<div style="max-height:400px;overflow-y:auto;"><table style="width:100%;border-collapse:collapse;margin:0;"><thead><tr style="background:#f5f5f5;"><th style="padding:8px;border:1px solid #ddd;text-align:left;">\u8bbf\u95ee\u65f6\u95f4</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">IP\u5730\u5740</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">User Agent</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">\u5f52\u5c5e\u5730</th></tr></thead><tbody>';
+ records.forEach(function(r){
+  var t=new Date(r.visit_time*1000).toLocaleString('zh-CN');
+  var ua=r.user_agent||'\u672a\u77e5';
+  var loc=r.location||'\u672a\u77e5\u5730\u533a';
+  if(ua.length>50)ua=ua.substring(0,50)+'...';
+  if(loc.length>30)loc=loc.substring(0,30)+'...';
+  h+='<tr><td style="padding:8px;border:1px solid #ddd;">'+t+'</td><td style="padding:8px;border:1px solid #ddd;">'+r.ip+'</td><td style="padding:8px;border:1px solid #ddd;" title="'+(r.user_agent||'')+'">'+ua+'</td><td style="padding:8px;border:1px solid #ddd;" title="'+(r.location||'')+'">'+loc+'</td></tr>';
+ });
+ h+='</tbody></table></div><p style="margin-top:15px;color:#666;font-size:12px;">\u663e\u793a\u6700\u8fd1100\u6761\u8bbf\u95ee\u8bb0\u5f55</p>';
+ el.innerHTML=h;
+}
+</script>
+EOS;
     }
 
     /**

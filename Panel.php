@@ -21,13 +21,16 @@ function parseTimeRangeDays($range) {
     return null;
 }
 
-// Referer 校验：所有 POST 请求必须来自本站，防止外部直接调用获取数据
+// CSRF 保护：对修改数据的 POST 请求校验 Referer（只读查询如 get_visit_records 不拦截）
 $request = Typecho_Request::getInstance();
-if ($request->isPost() && $request->get('action')) {
-    $siteHost = parse_url($options->siteUrl, PHP_URL_HOST);
-    $refererHost = $request->getReferer() ? parse_url($request->getReferer(), PHP_URL_HOST) : null;
-    if (!$refererHost || $refererHost !== $siteHost) {
-        die('Forbidden');
+if ($request->isPost()) {
+    $destructiveActions = array('clean_records', 'clear_cache', 'clean_expired_ip_data', 'delete_ip_location', 'add_to_blacklist', 'remove_from_blacklist', 'get_blacklist');
+    if (in_array($request->get('action'), $destructiveActions)) {
+        $siteHost = parse_url($options->siteUrl, PHP_URL_HOST);
+        $refererHost = $request->getReferer() ? parse_url($request->getReferer(), PHP_URL_HOST) : null;
+        if (!$refererHost || $refererHost !== $siteHost) {
+            die('Forbidden');
+        }
     }
 }
 
@@ -665,10 +668,15 @@ try {
     RecentViewsCounter_Blacklist::createTable();
 } catch (Exception $e) {}
 $blacklisted_ips = array();
+$blacklisted_cidrs = array();
 try {
     $bl_result = RecentViewsCounter_Blacklist::getList(1, 99999);
     foreach ($bl_result['data'] as $bl_item) {
-        $blacklisted_ips[$bl_item['ip']] = true;
+        if (strpos($bl_item['ip'], '/') !== false) {
+            $blacklisted_cidrs[] = $bl_item['ip'];
+        } else {
+            $blacklisted_ips[$bl_item['ip']] = true;
+        }
     }
 } catch (Exception $e) {}
 
@@ -683,6 +691,20 @@ try {
 
 foreach ($top_ips as &$ip_data) {
     $ip_data['is_blacklisted'] = isset($blacklisted_ips[$ip_data['ip']]) ? 1 : 0;
+    if (!$ip_data['is_blacklisted'] && !empty($blacklisted_cidrs)) {
+        foreach ($blacklisted_cidrs as $cidr) {
+            $parts = explode('/', $cidr);
+            $network = ip2long($parts[0]);
+            $ip_long = ip2long($ip_data['ip']);
+            if ($network !== false && $ip_long !== false) {
+                $mask = -1 << (32 - intval($parts[1]));
+                if (($ip_long & $mask) === ($network & $mask)) {
+                    $ip_data['is_blacklisted'] = 1;
+                    break;
+                }
+            }
+        }
+    }
 }
 unset($ip_data);
 
@@ -1145,12 +1167,13 @@ try {
                                         $visit_rate = $visit_duration > 0 ? $ip_data['count'] / ($visit_duration / 3600) : 0;
                                         if ($visit_rate > 10) $detection_details[] = '高频率';
                                         
-                                        if (empty($detection_details)) {
-                                            echo '<span style="color: #28a745;">正常</span>';
-                                        } else {
-                                            echo '<span style="color: #dc3545; font-size: 11px;">' . implode(', ', $detection_details) . '</span>';
-                                        }
+                                        $detail_text = implode(', ', $detection_details);
                                         ?>
+                                        <?php if (empty($detection_details)): ?>
+                                            <span style="color: #28a745;">正常</span>
+                                        <?php else: ?>
+                                            <span style="color: #dc3545; font-size: 11px;"><?php echo htmlspecialchars($detail_text); ?></span>
+                                        <?php endif; ?>
                                     </td>
                                     <td>
                                         <a href="javascript:void(0);" onclick="showIpVisitDetails('<?php echo htmlspecialchars($ip_data['ip']); ?>')" 
@@ -1163,6 +1186,7 @@ try {
                                             <span style="color: #dc3545; font-size: 12px;">☑ 已拉黑</span>
                                         <?php else: ?>
                                             <a href="javascript:void(0);" onclick="addToBlacklist('<?php echo htmlspecialchars($ip_data['ip']); ?>', this)"
+                                               data-detail="<?php echo htmlspecialchars($detail_text); ?>"
                                                style="color: #999; text-decoration: none; font-size: 12px;"
                                                title="加入黑名单">❌ 拉黑</a>
                                         <?php endif; ?>
@@ -1194,6 +1218,21 @@ try {
                             </tr></thead>
                             <tbody>
                                 <?php $rank = 1; $total_nb = array_sum(array_column($non_bot_top_ips, 'count')); foreach ($non_bot_top_ips as $ip_data): ?>
+                                <?php 
+                                $nb_detection_details = array();
+                                if ($ip_data['is_bot_ua'] && !empty($ip_data['detected_bot_name'])) {
+                                    $nb_detection_details[] = $ip_data['detected_bot_name'];
+                                } elseif ($ip_data['is_bot_ua']) {
+                                    $nb_detection_details[] = 'UA识别';
+                                }
+                                if ($ip_data['is_high_frequency']) $nb_detection_details[] = '高频访问';
+                                if ($ip_data['is_focused_crawler']) $nb_detection_details[] = '专注爬取';
+                                if ($ip_data['ua_variety'] == 1 && $ip_data['count'] > 10) $nb_detection_details[] = '单一UA';
+                                $nb_visit_duration = $ip_data['last_visit'] - $ip_data['first_visit'];
+                                $nb_visit_rate = $nb_visit_duration > 0 ? $ip_data['count'] / ($nb_visit_duration / 3600) : 0;
+                                if ($nb_visit_rate > 10) $nb_detection_details[] = '高频率';
+                                $nb_detail_text = implode(', ', $nb_detection_details);
+                                ?>
                                 <tr>
                                     <td><?php echo $rank++; ?></td>
                                     <td><strong style="font-family: monospace; color: #467b96;"><?php echo htmlspecialchars($ip_data['ip']); ?></strong></td>
@@ -1201,13 +1240,20 @@ try {
                                     <td><span style="color: #28a745; font-weight: bold;"><?php echo number_format($ip_data['count']); ?></span></td>
                                     <td><span style="color: #6c757d;"><?php echo $total_nb > 0 ? round(($ip_data['count'] / $total_nb) * 100, 1) : 0; ?>%</span></td>
                                     <td><span style="color: #28a745; font-weight: bold;"><?php echo $ip_data['bot_score']; ?>分</span></td>
-                                    <td><span style="color: #28a745;">正常</span></td>
+                                    <td>
+                                        <?php if (empty($nb_detection_details)): ?>
+                                            <span style="color: #28a745;">正常</span>
+                                        <?php else: ?>
+                                            <span style="color: #dc3545; font-size: 11px;"><?php echo htmlspecialchars($nb_detail_text); ?></span>
+                                        <?php endif; ?>
+                                    </td>
                                     <td><a href="javascript:void(0);" onclick="showIpVisitDetails('<?php echo htmlspecialchars($ip_data['ip']); ?>')" style="color: #0073aa; font-size: 12px;">📋 查看详情</a></td>
                                     <td>
                                         <?php if ($ip_data['is_blacklisted']): ?>
                                             <span style="color: #dc3545; font-size: 12px;">☑ 已拉黑</span>
                                         <?php else: ?>
                                             <a href="javascript:void(0);" onclick="addToBlacklist('<?php echo htmlspecialchars($ip_data['ip']); ?>', this)"
+                                               data-detail="<?php echo htmlspecialchars($nb_detail_text); ?>"
                                                style="color: #999; text-decoration: none; font-size: 12px;"
                                                title="加入黑名单">❌ 拉黑</a>
                                         <?php endif; ?>
@@ -1516,7 +1562,7 @@ try {
 var weekData = <?php echo json_encode($week_data); ?>;
 var monthlyStatsData = <?php echo json_encode($monthly_stats); ?>;
 </script>
-<script src="/usr/plugins/RecentViewsCounter/assets/visit-records.js"></script>
+<script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/visit-records.js'); ?>"></script>
 <script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/panel.js'); ?>"></script>
 
 <?php include_once __TYPECHO_ROOT_DIR__ . '/admin/footer.php'; ?>
