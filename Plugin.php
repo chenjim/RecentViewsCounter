@@ -137,9 +137,44 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             $db->query($ip_location_sql);
             // 创建IP黑名单表
             RecentViewsCounter_Blacklist::createTable();
+
+            // 创建文章页面访问频率日志表（MySQL 用 VARCHAR(45) 便于联合索引；SQLite 用 TEXT 兼容）
+            self::ensureIpRateLogTable();
         } catch (Exception $e) {
             error_log('RecentViewsCounter createTable错误: ' . $e->getMessage());
             throw $e;
+        }
+    }
+
+    /**
+     * 确保 ip_rate_log 表存在（MySQL 用 VARCHAR(45) 优化联合索引）
+     */
+    private static function ensureIpRateLogTable()
+    {
+        $db = Typecho_Db::get();
+        $prefix = $db->getPrefix();
+        $driver = $db->getAdapterName();
+        $isSqlite = stripos($driver, 'sqlite') !== false;
+        $auto_inc = $isSqlite ? 'AUTOINCREMENT' : 'AUTO_INCREMENT';
+        $ipCol = $isSqlite ? 'TEXT' : 'VARCHAR(45)';
+        $sql = "CREATE TABLE IF NOT EXISTS `{$prefix}ip_rate_log` (
+            `id` INTEGER NOT NULL PRIMARY KEY {$auto_inc},
+            `ip` {$ipCol} NOT NULL,
+            `url` TEXT NOT NULL,
+            `access_time` INTEGER NOT NULL
+        )";
+        if (!$isSqlite) {
+            $sql .= " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        }
+        $db->query($sql);
+        // 存量 MySQL TEXT → VARCHAR(45) 迁移（SQLite 无需）
+        if (!$isSqlite) {
+            try {
+                $col = $db->fetchRow($db->query("SHOW COLUMNS FROM `{$prefix}ip_rate_log` LIKE 'ip'"));
+                if ($col && stripos($col['Type'], 'varchar(45)') === false) {
+                    $db->query("ALTER TABLE `{$prefix}ip_rate_log` MODIFY COLUMN `ip` VARCHAR(45) NOT NULL");
+                }
+            } catch (Exception $e) {}
         }
     }
 
@@ -159,6 +194,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                 "idx_vr_cid_time" => "ON {$prefix}views_records (cid, visit_time)",
                 "idx_vr_ip_time"  => "ON {$prefix}views_records (ip, visit_time)",
                 "idx_vr_time"     => "ON {$prefix}views_records (visit_time)",
+                "idx_irl_ip_time" => "ON {$prefix}ip_rate_log (ip, access_time)",
             );
             foreach ($indexes as $name => $def) {
                 $sql = $isSqlite
@@ -372,6 +408,30 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             _t('是否启用IP黑名单功能，黑名单中的IP将被禁止访问并跳过统计')
         );
 
+        $enable_archive_rate_limit = new Typecho_Widget_Helper_Form_Element_Radio(
+            'enable_archive_rate_limit',
+            array('1' => '启用', '0' => '禁用'),
+            '1',
+            _t('文章页面频率限制'),
+            _t('是否启用对 /archives/*.html 页面的访问频率限制，超阈值自动封禁IP')
+        );
+
+        $archive_rate_window = new Typecho_Widget_Helper_Form_Element_Text(
+            'archive_rate_window',
+            NULL,
+            '86400',
+            _t('文章页面限流窗口（秒）'),
+            _t('统计时间窗口，默认86400秒（24小时）')
+        );
+
+        $archive_rate_threshold = new Typecho_Widget_Helper_Form_Element_Text(
+            'archive_rate_threshold',
+            NULL,
+            '50',
+            _t('文章页面限流阈值（次）'),
+            _t('窗口内允许的最大访问次数，超过则自动加入黑名单')
+        );
+
         $ip138_token = new Typecho_Widget_Helper_Form_Element_Text(
             'ip138_token',
             NULL,
@@ -389,6 +449,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $form->addInput($enable_rate_limit);
         $form->addInput($rate_limit_window);
         $form->addInput($rate_limit_threshold);
+        $form->addInput($enable_archive_rate_limit);
+        $form->addInput($archive_rate_window);
+        $form->addInput($archive_rate_threshold);
         $form->addInput($top_count);
         $form->addInput($cookie_time);
         $form->addInput($auto_clean);
@@ -459,6 +522,57 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
                 }
             } catch (Exception $e) {
                 error_log('RecentViewsCounter: 限流检查异常: ' . $e->getMessage());
+            }
+        }
+
+        // 文章页面频率限制：/archives/*.html（旧库未配置时默认启用）
+        $archiveRateEnabled = !$plugin_config || !isset($plugin_config->enable_archive_rate_limit) || $plugin_config->enable_archive_rate_limit == '1';
+        if ($archiveRateEnabled) {
+            $requestUri = $_SERVER['REQUEST_URI'] ?? '';
+            $requestPath = parse_url($requestUri, PHP_URL_PATH) ?: $requestUri;
+            if (preg_match('#^(?:/index\.php)?/archives/[^/]+\.html$#i', $requestPath)) {
+                $archiveWindow = isset($plugin_config->archive_rate_window) ? intval($plugin_config->archive_rate_window) : 86400;
+                if ($archiveWindow <= 0) $archiveWindow = 86400;
+                $archiveThreshold = isset($plugin_config->archive_rate_threshold) ? intval($plugin_config->archive_rate_threshold) : 50;
+                if ($archiveThreshold <= 0) $archiveThreshold = 50;
+
+                try {
+                    // 惰性建表：兼容已激活未重建表的存量环境
+                    try { self::ensureIpRateLogTable(); } catch (Exception $e) {}
+
+                    $row = $db->fetchRow(
+                        $db->select('COUNT(*) as count')
+                           ->from('table.ip_rate_log')
+                           ->where('ip = ?', $ip)
+                           ->where('access_time >= ?', $current_time - $archiveWindow)
+                    );
+                    $recentCount = isset($row['count']) ? intval($row['count']) : 0;
+
+                    // 含本次请求达到阈值即封禁（修正差一）
+                    if ($recentCount + 1 >= $archiveThreshold) {
+                        $reason = "archives页面{$archiveWindow}秒内访问{$recentCount}次(阈值{$archiveThreshold})";
+                        RecentViewsCounter_Blacklist::add($ip, $reason);
+                        error_log("RecentViewsCounter: archives限流自动封禁 IP={$ip} count={$recentCount} threshold={$archiveThreshold} uri={$requestUri}");
+
+                        while (ob_get_level()) ob_end_clean();
+                        header('HTTP/1.1 403 Forbidden', true, 403);
+                        header('Content-Type: text/html; charset=utf-8');
+                        echo '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body>';
+                        echo '<h1>403 Forbidden</h1>';
+                        echo '<p>您的IP因频繁访问文章页面已被自动封禁。</p>';
+                        echo '</body></html>';
+                        exit;
+                    }
+
+                    // 记录本次访问
+                    $db->query($db->insert('table.ip_rate_log')->rows(array(
+                        'ip' => $ip,
+                        'url' => $requestUri,
+                        'access_time' => $current_time
+                    )));
+                } catch (Exception $e) {
+                    error_log('RecentViewsCounter: 文章页面限流检查异常: ' . $e->getMessage());
+                }
             }
         }
     }
@@ -884,6 +998,31 @@ EOS;
                              ->where('visit_time < ?', $cutoff_time));
             } catch (Exception $e) {
                 // 静默处理错误，避免影响正常访问
+            }
+            // 清理 ip_rate_log 过期记录（窗口+1小时，避免边界误删）
+            try {
+                $archiveWindow = $plugin_config && isset($plugin_config->archive_rate_window) ? intval($plugin_config->archive_rate_window) : 86400;
+                if ($archiveWindow <= 0) $archiveWindow = 86400;
+                $rateLogCutoff = time() - $archiveWindow - 3600;
+                $db->query($db->delete('table.ip_rate_log')->where('access_time < ?', $rateLogCutoff));
+            } catch (Exception $e) {}
+
+            // 清理过期的 IP 归属地缓存（需启用 auto_clean_ip）
+            // 保留：ip_cache_days 内更新过的 或 clean_days 内仍来访的 IP，避免活跃IP归属地留空
+            try {
+                $autoCleanIp = $plugin_config && isset($plugin_config->auto_clean_ip) && $plugin_config->auto_clean_ip == '1';
+                if ($autoCleanIp) {
+                    $prefix = $db->getPrefix();
+                    $ipCacheDays = $plugin_config && $plugin_config->ip_cache_days ? intval($plugin_config->ip_cache_days) : 90;
+                    if ($ipCacheDays <= 0) $ipCacheDays = 90;
+                    $ipCutoff = time() - ($ipCacheDays * 24 * 3600);
+                    $ipActiveCutoff = time() - ($clean_days * 24 * 3600);
+                    $db->query("DELETE FROM {$prefix}ip_location
+                                WHERE updated_time < {$ipCutoff}
+                                  AND ip NOT IN (SELECT DISTINCT ip FROM {$prefix}views_records WHERE visit_time >= {$ipActiveCutoff})");
+                }
+            } catch (Exception $e) {
+                error_log('RecentViewsCounter: 自动清理IP归属地数据出错: ' . $e->getMessage());
             }
         }
         
