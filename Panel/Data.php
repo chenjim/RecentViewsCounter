@@ -410,7 +410,8 @@ $week_data = array();
 try {
     $thirty_days_ago = time() - 30 * 24 * 3600;
     $prefix = $db->getPrefix();
-    $tz_offset = intval(date('Z'));
+    // 站点时区偏移（秒），用于按站点本地日期聚合；date('Z') 只反映服务器时区，此处须用站点 timezone
+    $tz_offset = intval($options->timezone);
     
     // 1. 按IP聚合，计算Bot评分（仅加载独特IP）
     $ip_query = $db->select(
@@ -479,8 +480,9 @@ try {
         $bot = isset($bot_map[$ds]) ? $bot_map[$ds] : 0;
         $total = intval($row['cnt']);
         $week_data[] = array(
-            'date' => date('m-d', $ds * 86400 - $tz_offset),
-            'full_date' => date('Y-m-d', $ds * 86400 - $tz_offset),
+            // day_start 已在 SQL 中按站点时区平移到本地日，*86400 即为本地零点，不能再减 tz_offset
+            'date' => date('m-d', $ds * 86400),
+            'full_date' => date('Y-m-d', $ds * 86400),
             'visits' => $total,
             'real_users' => $total - $bot,
             'bots' => $bot

@@ -23,6 +23,16 @@
 
 ## 数据记录
 
+插件维护两张存储，各负责一段口径，互补使用：
+
+| 口径 | 存储 | 保留 | 用途 |
+| --- | --- | --- | --- |
+| 时间窗访问明细 | `typecho_views_records` | 按 `clean_days` 滚动清理（默认 30 天） | 周榜/月榜、报表、IP 与来源分析 |
+| 累计浏览量 | `typecho_contents.views` | 永久保留，单调递增 | 文章页/列表页「阅读量」、总榜 |
+
+> `views` 列原本由 ViewsCounter 插件维护，现已并入本插件（写入在 `recordVisit()` 里原子自增，
+> 插件升级时会自动确保该列存在，不再需要安装 ViewsCounter；独立 ViewsCounter 插件已移除，见下文迁移说明）。
+
 插件会为每次访问记录以下信息：
 - 文章ID (cid)
 - 访问时间戳 (visit_time)
@@ -74,7 +84,7 @@
 ## 配置选项
 
 - **IP归属地查询**: 启用/禁用IP地理位置查询
-- **IP138 API Token**: IP138接口的访问令牌，留空将使用默认token
+- **IP138 API Token**: IP138接口的访问令牌。留空则不使用IP138，改用免费的ip-api.com接口查询
 - **本地IP数据库**: 启用/禁用本地IP归属地数据库，优先从本地查询以提高性能
 - **IP归属地缓存天数**: 本地IP归属地数据的缓存天数
 - **自动清理IP数据**: 启用/禁用自动清理过期的IP归属地数据
@@ -82,6 +92,7 @@
 - **访问频率限制**: 启用/禁用高频访问拦截功能，防止恶意刷量
 - **限流窗口时间**: 统计访问频率的时间窗口（秒）
 - **限流阈值**: 在窗口时间内允许的最大访问次数
+- **IP 白名单**: 白名单内的 IP 不受限流(429)、文章页频率限制与自动封禁，也不受黑名单拦截
 - **热门文章数量**: 设置显示的热门文章数量
 - **重复访问间隔**: 防止刷量的时间间隔设置
 - **自动清理过期记录**: 启用/禁用自动清理功能
@@ -90,6 +101,42 @@
 - **缓存更新间隔**: 设置缓存文件的更新间隔时间（秒）
 - **缓存文件位置**: 设置缓存文件的存放路径
 - **访问来源统计**: 启用/禁用访问来源统计功能
+
+## IP 白名单
+
+白名单用于放行可信 IP（自己、公司/家庭出口 IP、内网、CDN 回源等），被放行的 IP 不会触发任何拦截：
+
+- 跳过高频访问限流（429）
+- 跳过文章页 `/archives/*.html` 频率限制
+- 跳过黑名单拦截
+- 不参与自动封禁
+
+> 放行只是跳过拦截，访问仍会正常记录与统计。
+
+### 配置位置
+
+后台 **插件 → RecentViewsCounter → 设置 → IP 白名单** 文本框。白名单是插件配置项 `whitelist_ips`，逗号分隔，保存即生效。
+
+### 支持格式
+
+| 格式 | 示例 | 说明 |
+| --- | --- | --- |
+| 精确 IP | `47.100.19.78` | IPv4/IPv6 均可 |
+| IPv4 CIDR | `192.168.0.0/16` | 网段匹配 |
+| IPv6 CIDR | `240e:b8f:96a::/48` | 按前缀位数匹配 |
+| IPv6 前缀 | `240e:b8f:96a:` | 前缀写法，等价于按字符前缀匹配 |
+
+分隔符支持逗号、分号与空白。`127.0.0.1` 与 `::1` 恒放行，无需配置。
+
+### 默认值
+
+```
+127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,58.35.118.0/24,240e:b8f:96a:,47.100.19.78
+```
+
+即本机回环、内网网段，加上站点自身的出口 IP（请按实际环境调整，勿直接照搬）。
+
+> **注意**：白名单在插件启用初始化时写入配置表。若是旧版升级后才新增该配置，需在设置页**保存一次**配置，否则 `whitelist_ips` 不会入库，此时仅回环地址被放行。
 
 ## 截图展示
 
@@ -151,6 +198,53 @@
 8. 使用数据管理功能清理过期记录和缓存
 
 ## 主题集成
+
+### 显示文章累计浏览量（替代 ViewsCounter）
+
+`getViews()` / `getViewsById()` / `getMostViewed()` 与原 ViewsCounter 同名同语义，
+主题里把调用从 `ViewsCounter_Plugin::` 换成 `RecentViewsCounter_Plugin::` 即可：
+
+```php
+<?php // 文章页 / 列表页：当前文章的累计浏览量
+_e('阅读量: '); echo RecentViewsCounter_Plugin::getViews(); ?>
+
+<?php // 列表页循环里：指定文章的累计浏览量
+echo RecentViewsCounter_Plugin::getViewsById($post->cid); ?>
+
+<?php // 累计浏览量总榜
+foreach (RecentViewsCounter_Plugin::getMostViewedAllTime(10) as $post) {
+    echo '<a href="' . Typecho_Common::url(Typecho_Router::url('post', $post), $this->options->index) . '">'
+        . htmlspecialchars($post['title']) . ' (' . intval($post['views']) . ')</a>';
+} ?>
+```
+
+列表页如果逐条调用，建议先批量预热一次，避免 N 次查询：
+
+```php
+<?php
+$cids = array_map(function ($post) { return $post['cid']; }, $posts);
+RecentViewsCounter_Plugin::preloadViews($cids);
+// 之后重复调用 getViewsById() 都走内存缓存
+?>
+```
+
+也可以通过 `RecentViewsCounter_Helper` 调用：
+
+```php
+<?php
+RecentViewsCounter_Helper::showCurrentTotalViews('阅读量: %d');   // 当前文章
+RecentViewsCounter_Helper::showPostTotalViews($post->cid);         // 指定文章
+$top = RecentViewsCounter_Helper::getMostViewedAllTime(10);        // 总榜
+?>
+```
+
+### 从 ViewsCounter 迁移
+
+独立的 `ViewsCounter` 插件（`usr/plugins/ViewsCounter/`）已删除，`ViewsCounter_Plugin` 类不再存在；
+累计浏览量能力已并入本插件，同名方法把类名换成 `RecentViewsCounter_Plugin::` 即可
+（`getViews()` / `getViewsById()` / `getMostViewed()`）。主题已改用 `$this->views` 与
+`lib/rankings.php`，`contents.views` 列由本插件维护，删旧插件不丢数据。旧站若仍启用
+ViewsCounter，先停用再删目录。
 
 ### 在侧边栏显示近期热门文章
 
@@ -328,6 +422,7 @@ IP 归属地由 `cron-update-ip-locations.php` 回填，绕过广告拦截器屏
 - 插件兼容MySQL严格模式（sql_mode=only_full_group_by）
 - 数据库查询已优化，支持高并发访问场景
 - **访问频率限制功能可能影响正常用户访问，请合理设置阈值**
+- **IP 白名单**：可信 IP 建议加入白名单，避免误伤；白名单为插件配置项而非后台列表，只能在插件设置页维护
 - 本地IP数据库会占用一定存储空间，可根据需要启用自动清理
 - 访问来源统计依赖HTTP Referer头，某些情况下可能不准确
 - **IP查询接口**: 插件优先使用IP138接口，备用ip-api.com接口，确保查询成功率
@@ -341,6 +436,13 @@ IP 归属地由 `cron-update-ip-locations.php` 回填，绕过广告拦截器屏
 - 插件地址: https://github.com/chenjim/RecentViewsCounter
 
 ## 更新日志
+
+### v1.1.1 (2026-09-18)
+- 🔐 新增 IP 白名单：白名单内 IP 跳过限流(429)、文章页频率限制、自动封禁与黑名单拦截
+- 🌐 白名单支持精确 IP、IPv4 CIDR、IPv6 CIDR/前缀，`127.0.0.1`/`::1` 恒放行
+- 📝 补充白名单配置说明（入口为插件设置页，无独立后台 UI）
+- 🕒 后台与文章页访问时间统一按站点时区显示，修正原先按服务器 UTC 显示导致的 8 小时偏差
+- 📅 访问趋势图按站点本地日期聚合，修正跨时区导致的日期/周末判定偏移
 
 ### v1.1.0 (2026-05-29)
 - 🛡️ AJAX 端点 Referer 校验覆盖所有 POST 操作，防止外部直接调用获取数据

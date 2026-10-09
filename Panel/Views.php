@@ -592,7 +592,7 @@
                         <?php endif; ?> 
                         
                         <div style="float: none; width: 100%; flex: 1 1 100%; min-width: 0; max-width: 100%; margin: 0; padding: 0; box-sizing: border-box; overflow-wrap: anywhere;">
-                            <p><strong>数据库信息：</strong>总访问记录 <?php echo number_format($db_stats['total_records']); ?> 条 ｜ 最近30天记录 <?php echo number_format($db_stats['recent_records']); ?> 条<?php if ($db_stats['earliest_time']): ?> ｜ 最早记录时间 <?php echo date('Y-m-d H:i:s', $db_stats['earliest_time']); ?><?php endif; ?></p>
+                            <p><strong>数据库信息：</strong>总访问记录 <?php echo number_format($db_stats['total_records']); ?> 条 ｜ 最近30天记录 <?php echo number_format($db_stats['recent_records']); ?> 条<?php if ($db_stats['earliest_time']): ?> ｜ 最早记录时间 <?php echo (new \Typecho\Date(intval($db_stats['earliest_time'])))->format('Y-m-d H:i:s'); ?><?php endif; ?></p>
                             
                             <form method="post" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; width: 100%; max-width: 100%;">
                                 <input type="hidden" name="action" value="clean_records">
@@ -608,7 +608,7 @@
                             $cache_file = __TYPECHO_ROOT_DIR__ . $plugin_config->cache_file;
                             $cache_enabled = $plugin_config && $plugin_config->enable_cache == '1';
                             ?>
-                            <p><strong>缓存信息：</strong>缓存状态 <?php if ($cache_enabled): ?><span style="color: #28a745;">已启用</span><?php else: ?><span style="color: #dc3545;">已禁用</span><?php endif; ?><?php if ($cache_enabled): ?> ｜ 缓存文件 <?php if (file_exists($cache_file)): ?><span style="color: #28a745;">存在</span> (<?php echo date('Y-m-d H:i:s', filemtime($cache_file)); ?>)<?php else: ?><span style="color: #ffc107;">不存在</span><?php endif; ?> ｜ 缓存间隔 <?php echo intval($plugin_config->cache_time); ?> 秒<?php endif; ?></p>
+                            <p><strong>缓存信息：</strong>缓存状态 <?php if ($cache_enabled): ?><span style="color: #28a745;">已启用</span><?php else: ?><span style="color: #dc3545;">已禁用</span><?php endif; ?><?php if ($cache_enabled): ?> ｜ 缓存文件 <?php if (file_exists($cache_file)): ?><span style="color: #28a745;">存在</span> (<?php echo (new \Typecho\Date(filemtime($cache_file)))->format('Y-m-d H:i:s'); ?>)<?php else: ?><span style="color: #ffc107;">不存在</span><?php endif; ?> ｜ 缓存间隔 <?php echo intval($plugin_config->cache_time); ?> 秒<?php endif; ?></p>
                             
                             <?php if ($cache_enabled): ?>
                             <form method="post" style="display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; width: 100%; max-width: 100%;"><input type="hidden" name="action" value="clear_cache"><button type="submit" class="btn btn-s" onclick="return confirm('确定要清理缓存文件吗？下次访问时将重新生成缓存。')" style="white-space: normal; max-width: 100%;">清理缓存</button></form>
@@ -643,7 +643,7 @@
                                         <tr>
                                             <td><span style="font-family:monospace;"><?php echo htmlspecialchars($rl['ip']); ?></span></td>
                                             <td style="word-break:break-all;"><?php echo htmlspecialchars($rl['url']); ?></td>
-                                            <td><?php echo date('Y-m-d H:i:s', intval($rl['access_time'])); ?></td>
+                                            <td><?php echo (new \Typecho\Date(intval($rl['access_time'])))->format('Y-m-d H:i:s'); ?></td>
                                         </tr>
                                         <?php endforeach; ?>
                                     </tbody>
@@ -674,7 +674,7 @@
                                         <tr>
                                             <td><span style="font-family:monospace;"><?php echo htmlspecialchars($ab['ip']); ?></span></td>
                                             <td><?php echo htmlspecialchars($ab['reason']); ?></td>
-                                            <td><?php echo date('Y-m-d H:i:s', intval($ab['created_time'])); ?></td>
+                                            <td><?php echo (new \Typecho\Date(intval($ab['created_time'])))->format('Y-m-d H:i:s'); ?></td>
                                             <td><button type="button" onclick="removeFromBlacklist('<?php echo htmlspecialchars($ab['ip']); ?>'); closeArchiveBanModal();" style="background:#28a745;color:#fff;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:12px;">解除封禁</button></td>
                                         </tr>
                                         <?php endforeach; ?>
@@ -715,7 +715,7 @@
                                     $oldest_ip = array('oldest_time' => null);
                                 }
                                 ?>
-                                <p><strong>本地IP数据库信息：</strong>总IP记录 <?php echo number_format($ip_stats['total_ips']); ?> 条 ｜ 最近30天新增 <?php echo number_format($recent_ip_stats['recent_ips']); ?> 条<?php if ($oldest_ip['oldest_time']): ?> ｜ 最早记录时间 <?php echo date('Y-m-d H:i:s', $oldest_ip['oldest_time']); ?><?php endif; ?></p>
+                                <p><strong>本地IP数据库信息：</strong>总IP记录 <?php echo number_format($ip_stats['total_ips']); ?> 条 ｜ 最近30天新增 <?php echo number_format($recent_ip_stats['recent_ips']); ?> 条<?php if ($oldest_ip['oldest_time']): ?> ｜ 最早记录时间 <?php echo (new \Typecho\Date(intval($oldest_ip['oldest_time'])))->format('Y-m-d H:i:s'); ?><?php endif; ?></p>
                                 
                                 <div style="margin-top: 15px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;"><button onclick="loadIpLocationData(1)" class="btn btn-s" style="white-space: normal; max-width: 100%;">查看IP数据</button><form method="post" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; max-width: 100%;"><input type="hidden" name="action" value="clean_expired_ip_data"><label for="ip_clean_days">清理</label><input type="number" name="clean_days" id="ip_clean_days" value="90" min="1" max="365" style="width: 60px;"><label for="ip_clean_days">天前的IP数据</label><button type="submit" class="btn btn-s" onclick="return confirm('确定要清理过期的IP归属地数据吗？此操作不可恢复！')" style="white-space: normal; max-width: 100%;">清理过期数据</button></form></div>
                                 <p style="margin-top: 10px; color: #666; font-size: 12px;">建议定期清理过期IP数据以节省存储空间</p>
@@ -781,7 +781,7 @@
                                     <tr id="bl_<?php echo htmlspecialchars($item['ip']); ?>">
                                         <td><strong style="font-family: monospace;"><?php echo htmlspecialchars($item['ip']); ?></strong></td>
                                         <td><?php echo htmlspecialchars($item['reason'] ?: '-'); ?></td>
-                                        <td><?php echo date('Y-m-d H:i:s', $item['created_time']); ?></td>
+                                        <td><?php echo (new \Typecho\Date(intval($item['created_time'])))->format('Y-m-d H:i:s'); ?></td>
                                         <td>
                                             <button onclick="removeFromBlacklist('<?php echo htmlspecialchars($item['ip']); ?>')"
                                                     style="background: #dc3545; color: white; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;">解封</button>
@@ -823,6 +823,7 @@
 <script>
 var weekData = <?php echo json_encode($week_data); ?>;
 var monthlyStatsData = <?php echo json_encode($monthly_stats); ?>;
+window.RVC_TZ_OFFSET = <?php echo intval($options->timezone); ?>;
 </script>
 <script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/utils/request.js'); ?>?v=<?php echo @filemtime(dirname(__DIR__).'/assets/utils/request.js'); ?>"></script>
 <script src="<?php $options->pluginUrl('/RecentViewsCounter/assets/modules/chart.js'); ?>?v=<?php echo @filemtime(dirname(__DIR__).'/assets/modules/chart.js'); ?>"></script>

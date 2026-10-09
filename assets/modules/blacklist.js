@@ -60,7 +60,7 @@ function renderBlacklistTable(resp) {
 
     var html = '';
     resp.data.forEach(function(item) {
-        var time = new Date(item.created_time * 1000).toLocaleString('zh-CN');
+        var time = rvcFormatTime(item.created_time);
         html += '<tr id="bl_' + item.ip + '">';
         html += '<td><strong style="font-family: monospace;">' + item.ip + '</strong></td>';
         html += '<td>' + (item.reason || '-') + '</td>';

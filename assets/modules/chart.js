@@ -112,11 +112,12 @@ function drawChart() {
         var x = padding + (i * chartWidth / (data.length - 1));
         var y = height - padding - ((data[i].real_users || 0) / maxValue * chartHeight);
         
-        // 判断是否为周末
+        // 判断是否为周末：full_date 已是站点本地日期，用 UTC 构造避免浏览器时区偏移导致星期错位
         var isWeekend = false;
         if (data[i].full_date) {
-            var date = new Date(data[i].full_date);
-            var dayOfWeek = date.getDay();
+            var parts = data[i].full_date.split('-');
+            var date = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10)));
+            var dayOfWeek = date.getUTCDay();
             isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
         }
         

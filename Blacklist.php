@@ -24,6 +24,61 @@ class RecentViewsCounter_Blacklist
         return ($ip_long & $mask) === ($network & $mask);
     }
 
+    /**
+     * 解析白名单配置（逗号/分号/空白分隔）
+     */
+    public static function parseWhitelist($raw)
+    {
+        $list = array();
+        if (!is_string($raw) || trim($raw) === '') return $list;
+        foreach (preg_split('/[\s,;]+/', $raw) as $item) {
+            $item = trim($item);
+            if ($item !== '') $list[] = $item;
+        }
+        return $list;
+    }
+
+    /**
+     * IP 是否命中白名单：精确 IP、IPv4 CIDR、IPv6 CIDR/前缀；127.0.0.1 与 ::1 恒放行
+     */
+    public static function isWhitelisted($ip, $raw = null)
+    {
+        if (empty($ip)) return false;
+        if ($ip === '127.0.0.1' || $ip === '::1') return true;
+        foreach (self::parseWhitelist($raw) as $rule) {
+            if ($rule === $ip) return true;
+            if (strpos($rule, '/') !== false) {
+                if (strpos($rule, ':') !== false) {
+                    if (self::ipv6InCidr($ip, $rule)) return true;
+                } elseif (self::ipInCidr($ip, $rule)) {
+                    return true;
+                }
+            } elseif (strpos($rule, ':') !== false) {
+                if (strpos($ip, $rule) === 0) return true;   // IPv6 前缀写法，如 240e:b8f:96a:
+            }
+        }
+        return false;
+    }
+
+    private static function ipv6InCidr($ip, $cidr)
+    {
+        $parts = explode('/', $cidr);
+        if (count($parts) !== 2) return false;
+        $binIp = @inet_pton($ip);
+        $binNet = @inet_pton($parts[0]);
+        if ($binIp === false || $binNet === false || strlen($binIp) !== strlen($binNet)) return false;
+        $bits = intval($parts[1]);
+        if ($bits < 0 || $bits > strlen($binNet) * 8) return false;
+        $bytes = intdiv($bits, 8);
+        $rest = $bits % 8;
+        if ($bytes > 0 && substr($binIp, 0, $bytes) !== substr($binNet, 0, $bytes)) return false;
+        if ($rest > 0) {
+            $mask = (0xFF << (8 - $rest)) & 0xFF;
+            if ((ord($binIp[$bytes]) & $mask) !== (ord($binNet[$bytes]) & $mask)) return false;
+        }
+        return true;
+    }
+
     public static function createTable()
     {
         try {

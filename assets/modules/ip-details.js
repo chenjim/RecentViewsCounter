@@ -141,7 +141,7 @@ function displayIpVisitDetails(records, ip) {
     `;
     
     records.forEach(record => {
-        const visitTime = new Date(record.visit_time * 1000).toLocaleString('zh-CN');
+        const visitTime = rvcFormatTime(record.visit_time);
         
         // 截断过长的User Agent
         let userAgent = record.user_agent || '未知';

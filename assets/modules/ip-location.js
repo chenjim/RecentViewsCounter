@@ -136,7 +136,7 @@ function displayIpLocationData(data, total, currentPage) {
     `;
     
     data.forEach(record => {
-        const updateTime = new Date(record.updated_time * 1000).toLocaleString('zh-CN');
+        const updateTime = rvcFormatTime(record.updated_time);
         
         html += `
             <tr>

@@ -2,6 +2,7 @@
 if (!defined('__TYPECHO_ROOT_DIR__')) exit;
 require_once dirname(__FILE__) . '/Blacklist.php';
 require_once dirname(__FILE__) . '/lib/IpLookup.php';
+require_once dirname(__FILE__) . '/TotalViews.php';
 
 /**
  * 文章近期浏览量统计插件，记录每次访问的详细信息，包括IP地址和归属地
@@ -225,6 +226,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             } catch (Exception $e) {
                 error_log('RecentViewsCounter: IP黑名单唯一索引迁移失败，可能存在重复IP: ' . $e->getMessage());
             }
+
+            // 确保 contents.views 列存在（累计浏览量的存储列，实现见 TotalViews.php）
+            RecentViewsCounter_TotalViews::ensureColumn();
         } catch (Exception $e) {
             error_log('RecentViewsCounter upgradeDatabase错误: ' . $e->getMessage());
             // 静默处理错误，避免影响插件启用
@@ -432,12 +436,20 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             _t('窗口内允许的最大访问次数，超过则自动加入黑名单')
         );
 
+        $whitelist_ips = new Typecho_Widget_Helper_Form_Element_Text(
+            'whitelist_ips',
+            NULL,
+            '127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,58.35.118.0/24,240e:b8f:96a:,47.100.19.78',
+            _t('IP 白名单'),
+            _t('白名单内的 IP 不受访问频率限制(429)与自动封禁，也不受黑名单拦截。支持精确 IP、IPv4 CIDR(1.2.3.0/24)、IPv6 前缀(240e:b8f:96a:)，逗号分隔')
+        );
+
         $ip138_token = new Typecho_Widget_Helper_Form_Element_Text(
             'ip138_token',
             NULL,
             '',
             _t('IP138 API Token'),
-            _t('IP138接口的访问令牌，留空将使用默认token')
+            _t('IP138接口的访问令牌。留空则不使用IP138，改用免费的ip-api.com接口查询')
         );
         
         $form->addInput($enable_location);
@@ -452,6 +464,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $form->addInput($enable_archive_rate_limit);
         $form->addInput($archive_rate_window);
         $form->addInput($archive_rate_threshold);
+        $form->addInput($whitelist_ips);
         $form->addInput($top_count);
         $form->addInput($cookie_time);
         $form->addInput($auto_clean);
@@ -489,8 +502,11 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $options = Typecho_Widget::widget('Widget_Options');
         $plugin_config = $options->plugin('RecentViewsCounter');
         
+        // 白名单：不受限流与自动封禁（命中白名单属正常路径，不写日志，避免刷屏）
+        $isWhitelistedIp = RecentViewsCounter_Blacklist::isWhitelisted($ip, isset($plugin_config->whitelist_ips) ? $plugin_config->whitelist_ips : null);
+
         // IP黑名单拦截
-        if ($plugin_config && $plugin_config->enable_ip_blacklist == '1' && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
+        if (!$isWhitelistedIp && $plugin_config && $plugin_config->enable_ip_blacklist == '1' && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
             while (ob_get_level()) ob_end_clean();
             header('HTTP/1.1 403 Forbidden', true, 403);
             header('Content-Type: text/plain; charset=utf-8');
@@ -499,7 +515,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         }
         
         // 高频访问硬拦截
-        if ($plugin_config && $plugin_config->enable_rate_limit == '1') {
+        if (!$isWhitelistedIp && $plugin_config && $plugin_config->enable_rate_limit == '1') {
             try {
                 $rateWindow = $plugin_config->rate_limit_window ? intval($plugin_config->rate_limit_window) : 60;
                 $rateLimit = $plugin_config->rate_limit_threshold ? intval($plugin_config->rate_limit_threshold) : 10;
@@ -527,7 +543,7 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
 
         // 文章页面频率限制：/archives/*.html（旧库未配置时默认启用）
         $archiveRateEnabled = !$plugin_config || !isset($plugin_config->enable_archive_rate_limit) || $plugin_config->enable_archive_rate_limit == '1';
-        if ($archiveRateEnabled) {
+        if ($archiveRateEnabled && !$isWhitelistedIp) {
             $requestUri = $_SERVER['REQUEST_URI'] ?? '';
             $requestPath = parse_url($requestUri, PHP_URL_PATH) ?: $requestUri;
             if (preg_match('#^(?:/index\.php)?/archives/[^/]+\.html$#i', $requestPath)) {
@@ -610,7 +626,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
         $plugin_config = $options->plugin('RecentViewsCounter');
 
         // IP黑名单拦截（不记录访问）
-        if ($plugin_config && $plugin_config->enable_ip_blacklist == '1' && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
+        if ($plugin_config && $plugin_config->enable_ip_blacklist == '1'
+            && !RecentViewsCounter_Blacklist::isWhitelisted($ip, isset($plugin_config->whitelist_ips) ? $plugin_config->whitelist_ips : null)
+            && RecentViewsCounter_Blacklist::isBlacklisted($ip)) {
             return;
         }
 
@@ -656,6 +674,9 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
             $cookie_time = $plugin_config ? intval($plugin_config->cookie_time) : 3600;
             Typecho_Cookie::set("views_month_{$cid}_{$ip}", '1', $current_time + $cookie_time);
             
+            // 累计浏览量 +1（实现见 TotalViews.php）
+            RecentViewsCounter_TotalViews::increment($cid);
+
             // 自动更新当月统计
             self::autoUpdateCurrentMonthStats();
         } catch (Exception $e) {
@@ -682,8 +703,53 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
     public static function handleFooter()
     {
         self::cleanOldRecords();
+        self::cleanOldIpLocations();
         self::triggerIpLocationUpdate();
         self::injectVisitRecordsJs();
+    }
+
+    /**
+     * 自动清理过期的 IP 归属地缓存（仅由 auto_clean_ip 控制，每日最多一次）
+     * 过期记录直接删除，下次该 IP 访问时再重新查询记录
+     */
+    private static function cleanOldIpLocations()
+    {
+        $options = Typecho_Widget::widget('Widget_Options');
+        $plugin_config = $options->plugin('RecentViewsCounter');
+
+        $autoCleanIp = $plugin_config && isset($plugin_config->auto_clean_ip) && $plugin_config->auto_clean_ip == '1';
+        if (!$autoCleanIp) return;
+
+        // 每天最多执行一次
+        $lockFile = sys_get_temp_dir() . '/rvc_ip_clean.lock';
+        $cooldown = 86400;
+        if (file_exists($lockFile)) {
+            $mtime = @filemtime($lockFile);
+            if ($mtime && (time() - $mtime) < $cooldown) return;
+        }
+
+        // 非阻塞文件锁，防止并发
+        $fp = @fopen($lockFile, 'c');
+        if (!$fp || !flock($fp, LOCK_EX | LOCK_NB)) {
+            if ($fp) fclose($fp);
+            return;
+        }
+
+        try {
+            $db = Typecho_Db::get();
+            $prefix = $db->getPrefix();
+            $ipCacheDays = $plugin_config && $plugin_config->ip_cache_days ? intval($plugin_config->ip_cache_days) : 90;
+            if ($ipCacheDays <= 0) $ipCacheDays = 90;
+            $ipCutoff = time() - ($ipCacheDays * 24 * 3600);
+
+            $db->query("DELETE FROM {$prefix}ip_location WHERE updated_time < {$ipCutoff}");
+            @touch($lockFile);
+        } catch (Exception $e) {
+            error_log('RecentViewsCounter: 自动清理IP归属地数据出错: ' . $e->getMessage());
+        }
+
+        flock($fp, LOCK_UN);
+        fclose($fp);
     }
 
     /**
@@ -752,9 +818,19 @@ class RecentViewsCounter_Plugin implements Typecho_Plugin_Interface
 
         $options = Typecho_Widget::widget('Widget_Options');
         $adminUrl = $options->adminUrl;
+        $tzOffset = intval($options->timezone);
+        $requestJsPath = dirname(__FILE__) . '/assets/utils/request.js';
+        $requestJsUrl = rtrim($options->pluginUrl, '/') . '/RecentViewsCounter/assets/utils/request.js';
+        if (file_exists($requestJsPath)) {
+            $requestJsUrl .= '?v=' . @filemtime($requestJsPath);
+        }
         echo <<<EOS
 <script>
 window.RVC_ADMIN_URL="{$adminUrl}";
+window.RVC_TZ_OFFSET={$tzOffset};
+</script>
+<script src="{$requestJsUrl}"></script>
+<script>
 function showVisitRecords(cid,title){
  var modal=document.createElement('div');
  modal.id='visitRecordsModal';
@@ -797,7 +873,7 @@ function displayVisitRecords(records){
  if(!records||records.length===0){el.innerHTML='<p>\u6682\u65e0\u8bbf\u95ee\u8bb0\u5f55</p>';return;}
  var h='<div style="max-height:400px;overflow-y:auto;"><table style="width:100%;border-collapse:collapse;margin:0;"><thead><tr style="background:#f5f5f5;"><th style="padding:8px;border:1px solid #ddd;text-align:left;">\u8bbf\u95ee\u65f6\u95f4</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">IP\u5730\u5740</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">User Agent</th><th style="padding:8px;border:1px solid #ddd;text-align:left;">\u5f52\u5c5e\u5730</th></tr></thead><tbody>';
  records.forEach(function(r){
-  var t=new Date(r.visit_time*1000).toLocaleString('zh-CN');
+  var t=rvcFormatTime(r.visit_time);
   var ua=r.user_agent||'\u672a\u77e5';
   var loc=r.location||'\u672a\u77e5\u5730\u533a';
   if(ua.length>50)ua=ua.substring(0,50)+'...';
@@ -969,6 +1045,77 @@ EOS;
         }
     }
 
+    /* ==================================================================
+     * ViewsCounter 兼容层（实现全部在 TotalViews.php）
+     *
+     * 保留与原 ViewsCounter 同名的入口，主题从 ViewsCounter_Plugin::x()
+     * 换成 RecentViewsCounter_Plugin::x() 即可，无需改语义。
+     * 这里只做转发，逻辑不放在本文件，避免主文件继续膨胀。
+     * ================================================================== */
+
+    /**
+     * 累计浏览量原子自增（供 recordVisit 调用）
+     *
+     * @param int $cid
+     */
+    public static function incrementTotalViews($cid)
+    {
+        RecentViewsCounter_TotalViews::increment($cid);
+    }
+
+    /**
+     * 批量预热累计浏览量缓存（兼容入口）
+     *
+     * @param array $cids
+     */
+    public static function preloadViews(array $cids)
+    {
+        RecentViewsCounter_TotalViews::preload($cids);
+    }
+
+    /**
+     * 取指定文章的累计浏览量（兼容 ViewsCounter::getViewsById）
+     *
+     * @param int $cid
+     * @return int
+     */
+    public static function getViewsById($cid)
+    {
+        return RecentViewsCounter_TotalViews::getById($cid);
+    }
+
+    /**
+     * 取当前文章的累计浏览量（兼容 ViewsCounter::getViews）
+     *
+     * @return int
+     */
+    public static function getViews()
+    {
+        return RecentViewsCounter_TotalViews::getCurrent();
+    }
+
+    /**
+     * 累计浏览量排行榜（兼容 ViewsCounter::getMostViewed）
+     *
+     * @param int|null $limit
+     * @return array
+     */
+    public static function getMostViewed($limit = null)
+    {
+        return RecentViewsCounter_TotalViews::getTop($limit);
+    }
+
+    /**
+     * getMostViewed 的语义别名
+     *
+     * @param int|null $limit
+     * @return array
+     */
+    public static function getMostViewedAllTime($limit = null)
+    {
+        return RecentViewsCounter_TotalViews::getTopAllTime($limit);
+    }
+
     /**
      * 自动清理过期的访问记录
      */
@@ -1006,24 +1153,6 @@ EOS;
                 $rateLogCutoff = time() - $archiveWindow - 3600;
                 $db->query($db->delete('table.ip_rate_log')->where('access_time < ?', $rateLogCutoff));
             } catch (Exception $e) {}
-
-            // 清理过期的 IP 归属地缓存（需启用 auto_clean_ip）
-            // 保留：ip_cache_days 内更新过的 或 clean_days 内仍来访的 IP，避免活跃IP归属地留空
-            try {
-                $autoCleanIp = $plugin_config && isset($plugin_config->auto_clean_ip) && $plugin_config->auto_clean_ip == '1';
-                if ($autoCleanIp) {
-                    $prefix = $db->getPrefix();
-                    $ipCacheDays = $plugin_config && $plugin_config->ip_cache_days ? intval($plugin_config->ip_cache_days) : 90;
-                    if ($ipCacheDays <= 0) $ipCacheDays = 90;
-                    $ipCutoff = time() - ($ipCacheDays * 24 * 3600);
-                    $ipActiveCutoff = time() - ($clean_days * 24 * 3600);
-                    $db->query("DELETE FROM {$prefix}ip_location
-                                WHERE updated_time < {$ipCutoff}
-                                  AND ip NOT IN (SELECT DISTINCT ip FROM {$prefix}views_records WHERE visit_time >= {$ipActiveCutoff})");
-                }
-            } catch (Exception $e) {
-                error_log('RecentViewsCounter: 自动清理IP归属地数据出错: ' . $e->getMessage());
-            }
         }
         
         $cleaned = true;

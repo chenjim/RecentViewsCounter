@@ -155,6 +155,51 @@ class RecentViewsCounter_Helper
         $plugins = Typecho_Plugin::export();
         return isset($plugins['activated']['RecentViewsCounter']);
     }
+
+    /* ==================================================================
+     * 累计浏览量（原 ViewsCounter 的能力，已并入本插件）
+     * 与「月度访问量」的区别：月度取 views_records 明细，累计取 contents.views
+     * ================================================================== */
+
+    /**
+     * 获取当前文章的累计浏览量
+     */
+    public static function getCurrentTotalViews()
+    {
+        return RecentViewsCounter_Plugin::getViews();
+    }
+
+    /**
+     * 显示当前文章的累计浏览量
+     */
+    public static function showCurrentTotalViews($format = '阅读量: %d')
+    {
+        printf($format, self::getCurrentTotalViews());
+    }
+
+    /**
+     * 获取指定文章的累计浏览量
+     */
+    public static function getPostTotalViews($cid)
+    {
+        return RecentViewsCounter_Plugin::getViewsById($cid);
+    }
+
+    /**
+     * 显示指定文章的累计浏览量
+     */
+    public static function showPostTotalViews($cid, $format = '%d')
+    {
+        printf($format, self::getPostTotalViews($cid));
+    }
+
+    /**
+     * 获取累计浏览量排行榜（总榜）
+     */
+    public static function getMostViewedAllTime($limit = 5)
+    {
+        return RecentViewsCounter_Plugin::getMostViewedAllTime($limit);
+    }
 }
 
 /**
@@ -190,6 +235,16 @@ function getMonthlyViews($cid = null) {
         } else {
             return RecentViewsCounter_Helper::getCurrentMonthlyViews();
         }
+    }
+    return 0;
+}
+
+// 获取文章累计浏览量（cid 为空时取当前文章）
+function getTotalViews($cid = null) {
+    if (RecentViewsCounter_Helper::isPluginActive()) {
+        return $cid
+            ? RecentViewsCounter_Helper::getPostTotalViews($cid)
+            : RecentViewsCounter_Helper::getCurrentTotalViews();
     }
     return 0;
 }

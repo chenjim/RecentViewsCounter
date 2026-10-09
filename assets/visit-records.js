@@ -63,7 +63,7 @@ function displayVisitRecords(records) {
         '<th style="padding:8px;border:1px solid #ddd;text-align:left;">归属地</th>' +
         '</tr></thead><tbody>';
     records.forEach(function(r) {
-        var t = new Date(r.visit_time * 1000).toLocaleString('zh-CN');
+        var t = (typeof rvcFormatTime === 'function') ? rvcFormatTime(r.visit_time) : new Date(r.visit_time * 1000).toLocaleString('zh-CN');
         var ua = r.user_agent || '未知';
         var loc = r.location || '未知地区';
         if (ua.length > 50) ua = ua.substring(0, 50) + '...';
